@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training logs & TensorBoard events
+runs/
+logs/
+wandb/
+
+# Recorded videos & saved models
+videos/
+models/
+*.mp4
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
