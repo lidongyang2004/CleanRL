@@ -39,9 +39,9 @@ PPO 通过限制新旧策略概率比值 r_t(θ) = π_new(a|s) / π_old(a|s) 只
 
 import argparse
 import random
+import shutil
 import time
 from pathlib import Path
-from typing import Callable
 
 import gymnasium as gym
 import numpy as np
@@ -53,7 +53,7 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数（与 SB3 02_ppo_cartpole.py 完全一致）。"""
     parser = argparse.ArgumentParser(description="CleanRL PPO 并行环境训练 CartPole-v1 示例")
     parser.add_argument(
@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     """固定随机种子，保证实验结果可复现。"""
     random.seed(seed)
     np.random.seed(seed)
@@ -76,25 +76,22 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_next_run_dir(log_dir: Path, tb_log_name: str) -> Path:
-    """模仿 SB3 自动递增生成 TensorBoard 子目录（如 PPO_CartPole_1, PPO_CartPole_2）。"""
-    idx = 1
-    while (log_dir / f"{tb_log_name}_{idx}").exists():
-        idx += 1
-    run_dir = log_dir / f"{tb_log_name}_{idx}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+def reset_dir(dir_path):
+    """清空并重建目录，确保每次运行只保留最新一次记录或模型。"""
+    if dir_path.exists():
+        shutil.rmtree(dir_path)
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 
-def make_vec_env(env_id: str, n_envs: int, seed: int) -> gym.vector.SyncVectorEnv:
+def make_vec_env(env_id, n_envs, seed):
     """
     CleanRL 白盒实现的并行环境构造函数（对应 SB3 `make_vec_env`）：
     为每个子环境套上 RecordEpisodeStatistics 包装器，并使用 SAME_STEP 自动重置模式，
     确保子环境结束时立即重置并将终止状态保存在 infos["final_obs"] 中。
     """
 
-    def make_single_env(rank: int) -> Callable[[], gym.Env]:
-        def _init() -> gym.Env:
+    def make_single_env(rank):
+        def _init():
             env = gym.wrappers.RecordEpisodeStatistics(gym.make(env_id))
             env.reset(seed=seed + rank)
             return env
@@ -112,7 +109,7 @@ def make_vec_env(env_id: str, n_envs: int, seed: int) -> gym.vector.SyncVectorEn
 # CleanRL 白盒组件 1：正交初始化与 ActorCriticPolicy 双分支解耦网络
 # 严格对应 SB3 `ActorCriticPolicy(net_arch=dict(pi=[64, 64], vf=[64, 64]))`
 # ==============================================================================
-def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     """
     PPO 核心工程技巧：正交初始化 (Orthogonal Initialization)。
     - 隐藏层使用 gain=sqrt(2) 配合 Tanh 激活函数保持方差稳定；
@@ -127,9 +124,9 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.
 class MlpExtractor(nn.Module):
     """对应 SB3 的 MlpExtractor：分别构建互不共享参数的 Actor 特征主干 (policy_net) 与 Critic 特征主干 (value_net)。"""
 
-    def __init__(self, obs_dim: int, pi_arch: list[int], vf_arch: list[int]) -> None:
+    def __init__(self, obs_dim, pi_arch, vf_arch):
         super().__init__()
-        pi_layers: list[nn.Module] = []
+        pi_layers = []
         in_dim = obs_dim
         for h_dim in pi_arch:
             pi_layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))
@@ -137,7 +134,7 @@ class MlpExtractor(nn.Module):
             in_dim = h_dim
         self.policy_net = nn.Sequential(*pi_layers)
 
-        vf_layers: list[nn.Module] = []
+        vf_layers = []
         in_dim = obs_dim
         for h_dim in vf_arch:
             vf_layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))
@@ -145,7 +142,7 @@ class MlpExtractor(nn.Module):
             in_dim = h_dim
         self.value_net = nn.Sequential(*vf_layers)
 
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, features):
         return self.policy_net(features), self.value_net(features)
 
 
@@ -156,7 +153,7 @@ class ActorCriticPolicy(nn.Module):
     - Critic 分支输出标量状态价值估计 V(s)。
     """
 
-    def __init__(self, obs_dim: int, n_actions: int, net_arch: dict[str, list[int]]) -> None:
+    def __init__(self, obs_dim, n_actions, net_arch):
         super().__init__()
         pi_arch = net_arch.get("pi", [64, 64])
         vf_arch = net_arch.get("vf", [64, 64])
@@ -166,15 +163,13 @@ class ActorCriticPolicy(nn.Module):
         self.action_net = layer_init(nn.Linear(pi_arch[-1], n_actions), std=0.01)
         self.value_net = layer_init(nn.Linear(vf_arch[-1], 1), std=1.0)
 
-    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
+    def get_value(self, obs):
         """仅计算状态价值 V(s)，形状 (batch_size, 1)。"""
         features = self.features_extractor(obs)
         _, latent_vf = self.mlp_extractor(features)
         return self.value_net(latent_vf)
 
-    def get_action_and_value(
-        self, obs: torch.Tensor, action: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_action_and_value(self, obs, action=None):
         """
         CleanRL 经典四合一前向接口：
         同时返回 (动作 action, 动作对数概率 log_prob, 分布熵 entropy, 状态价值 value)。
@@ -187,7 +182,7 @@ class ActorCriticPolicy(nn.Module):
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), self.value_net(latent_vf)
 
-    def predict(self, obs: np.ndarray, deterministic: bool = True) -> tuple[int | np.ndarray, None]:
+    def predict(self, obs, deterministic=True):
         """与 SB3 完全一致的推理接口：deterministic=True 时取概率最大的离散动作 argmax。"""
         device = next(self.parameters()).device
         with torch.no_grad():
@@ -217,14 +212,14 @@ class RolloutBuffer:
     并在采样结束时通过广义优势估计 (GAE) 逆序递推计算优势函数与回报目标。
     """
 
-    def __init__(self, n_steps: int, n_envs: int, obs_shape: tuple[int, ...], device: torch.device) -> None:
+    def __init__(self, n_steps, n_envs, obs_shape, device):
         self.n_steps = n_steps
         self.n_envs = n_envs
         self.obs_shape = obs_shape
         self.device = device
         self.reset()
 
-    def reset(self) -> None:
+    def reset(self):
         self.observations = np.zeros((self.n_steps, self.n_envs, *self.obs_shape), dtype=np.float32)
         self.actions = np.zeros((self.n_steps, self.n_envs), dtype=np.int64)
         self.rewards = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
@@ -235,15 +230,7 @@ class RolloutBuffer:
         self.returns = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
         self.pos = 0
 
-    def add(
-        self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        reward: np.ndarray,
-        done: np.ndarray,
-        value: np.ndarray,
-        log_prob: np.ndarray,
-    ) -> None:
+    def add(self, obs, action, reward, done, value, log_prob):
         self.observations[self.pos] = obs
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
@@ -252,9 +239,7 @@ class RolloutBuffer:
         self.log_probs[self.pos] = log_prob
         self.pos += 1
 
-    def compute_returns_and_advantage(
-        self, last_values: np.ndarray, gamma: float, gae_lambda: float
-    ) -> None:
+    def compute_returns_and_advantage(self, last_values, gamma, gae_lambda):
         """
         从最后一步 t = n_steps - 1 逆序向前递推计算广义优势估计 (GAE)：
             δ_t = r_t + γ * V(s_{t+1}) * (1 - done_t) - V(s_t)
@@ -277,15 +262,15 @@ class RolloutBuffer:
 
 
 def evaluate_policy(
-    policy: ActorCriticPolicy,
-    eval_env: gym.Env,
-    n_eval_episodes: int = 10,
-    deterministic: bool = True,
-    return_episode_rewards: bool = False,
-) -> tuple[float, float] | tuple[list[float], list[int]]:
+    policy,
+    eval_env,
+    n_eval_episodes=10,
+    deterministic=True,
+    return_episode_rewards=False,
+):
     """在独立 eval_env 上运行 n_eval_episodes 个完整回合，返回平均奖励与标准差。"""
-    episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
+    episode_rewards = []
+    episode_lengths = []
 
     for _ in range(n_eval_episodes):
         obs, _ = eval_env.reset()
@@ -306,7 +291,7 @@ def evaluate_policy(
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
 
-def main() -> None:
+def main():
     args = parse_args()
     set_seed(args.seed)
     env_id = "CartPole-v1"
@@ -315,8 +300,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "ppo_cartpole"
     log_dir = base_dir / "logs" / "ppo_cartpole"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    reset_dir(model_dir)
+    reset_dir(log_dir)
 
     # ==========================================================================
     # 第 1 步：创建矢量化并行环境与空间剖析
@@ -390,14 +375,15 @@ def main() -> None:
     best_mean_reward = -float("inf")
     best_model_path = model_dir / "best_model.pt"
 
-    tb_run_dir = get_next_run_dir(log_dir, "PPO_CartPole")
+    tb_run_dir = log_dir / "PPO_CartPole"
+    tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps: list[int] = []
-    eval_results: list[list[float]] = []
-    eval_ep_lengths: list[list[int]] = []
-    recent_ep_rewards: list[float] = []
-    recent_ep_lengths: list[int] = []
+    eval_timesteps = []
+    eval_results = []
+    eval_ep_lengths = []
+    recent_ep_rewards = []
+    recent_ep_lengths = []
 
     obs, _ = train_env.reset(seed=args.seed)
     global_step = 0

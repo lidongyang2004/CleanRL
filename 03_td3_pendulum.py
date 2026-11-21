@@ -44,6 +44,7 @@ TD3 提出了三项极具工程威力的改进（也是名字 Twin Delayed 的�
 
 import argparse
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -57,7 +58,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数（与 SB3 03_td3_pendulum.py 完全一致）。"""
     parser = argparse.ArgumentParser(description="CleanRL TD3 求解 Pendulum-v1 连续控制示例")
     parser.add_argument(
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     """固定随机种子，保证实验结果可复现。"""
     random.seed(seed)
     np.random.seed(seed)
@@ -79,14 +80,11 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_next_run_dir(log_dir: Path, tb_log_name: str) -> Path:
-    """模仿 SB3 自动递增生成 TensorBoard 子目录（如 TD3_Pendulum_1）。"""
-    idx = 1
-    while (log_dir / f"{tb_log_name}_{idx}").exists():
-        idx += 1
-    run_dir = log_dir / f"{tb_log_name}_{idx}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+def reset_dir(dir_path):
+    """清空并重建目录，确保每次运行只保留最新一次记录或模型。"""
+    if dir_path.exists():
+        shutil.rmtree(dir_path)
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 
 # ==============================================================================
@@ -96,11 +94,11 @@ def get_next_run_dir(log_dir: Path, tb_log_name: str) -> Path:
 class NormalActionNoise:
     """独立同分布的高斯动作噪声（对应 SB3 `NormalActionNoise`）。"""
 
-    def __init__(self, mean: np.ndarray, sigma: np.ndarray) -> None:
+    def __init__(self, mean, sigma):
         self.mean = mean.astype(np.float32)
         self.sigma = sigma.astype(np.float32)
 
-    def __call__(self) -> np.ndarray:
+    def __call__(self):
         return np.random.normal(self.mean, self.sigma).astype(np.float32)
 
 
@@ -115,13 +113,7 @@ class ReplayBufferSamples(NamedTuple):
 class ReplayBuffer:
     """连续动作经验回放池，存储 (s, a, r, s', terminated)。"""
 
-    def __init__(
-        self,
-        buffer_size: int,
-        obs_shape: tuple[int, ...],
-        action_dim: int,
-        device: torch.device,
-    ) -> None:
+    def __init__(self, buffer_size, obs_shape, action_dim, device):
         self.buffer_size = buffer_size
         self.device = device
         self.pos = 0
@@ -133,14 +125,7 @@ class ReplayBuffer:
         self.rewards = np.zeros((buffer_size, 1), dtype=np.float32)
         self.dones = np.zeros((buffer_size, 1), dtype=np.float32)
 
-    def add(
-        self,
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        action: np.ndarray,
-        reward: float,
-        terminated: bool,
-    ) -> None:
+    def add(self, obs, next_obs, action, reward, terminated):
         self.observations[self.pos] = obs
         self.next_observations[self.pos] = next_obs
         self.actions[self.pos] = action
@@ -152,7 +137,7 @@ class ReplayBuffer:
             self.full = True
             self.pos = 0
 
-    def sample(self, batch_size: int) -> ReplayBufferSamples:
+    def sample(self, batch_size):
         upper_bound = self.buffer_size if self.full else self.pos
         batch_inds = np.random.randint(0, upper_bound, size=batch_size)
         return ReplayBufferSamples(
@@ -174,17 +159,10 @@ class Actor(nn.Module):
     最后一层接 Tanh() 将输出压缩至 [-1, 1]，再通过仿射变换还原至物理环境真实量程 [low, high]。
     """
 
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        pi_arch: list[int],
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-    ) -> None:
+    def __init__(self, obs_dim, action_dim, pi_arch, action_low, action_high):
         super().__init__()
         self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-        layers: list[nn.Module] = []
+        layers = []
         in_dim = obs_dim
         for h_dim in pi_arch:
             layers.append(nn.Linear(in_dim, h_dim))
@@ -203,7 +181,7 @@ class Actor(nn.Module):
             torch.tensor((action_high + action_low) / 2.0, dtype=torch.float32),
         )
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs):
         features = self.features_extractor(obs)
         scaled_tanh = self.mu(features)
         return scaled_tanh * self.action_scale + self.action_bias
@@ -215,12 +193,12 @@ class ContinuousCritic(nn.Module):
     输入为状态向量 s 与动作向量 a 的拼接 torch.cat([obs, action], dim=1)，维度为 dim(S) + dim(A)。
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, qf_arch: list[int]) -> None:
+    def __init__(self, obs_dim, action_dim, qf_arch):
         super().__init__()
         self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
 
-        def build_q_net() -> nn.Sequential:
-            layers: list[nn.Module] = []
+        def build_q_net():
+            layers = []
             in_dim = obs_dim + action_dim
             for h_dim in qf_arch:
                 layers.append(nn.Linear(in_dim, h_dim))
@@ -232,12 +210,12 @@ class ContinuousCritic(nn.Module):
         self.qf0 = build_q_net()
         self.qf1 = build_q_net()
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs, action):
         features = self.features_extractor(obs)
         q_input = torch.cat([features, action], dim=1)
         return self.qf0(q_input), self.qf1(q_input)
 
-    def q1_forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def q1_forward(self, obs, action):
         """仅计算第一个 Q 网络 qf0(s, a)，用于计算确定性策略梯度更新 Actor。"""
         features = self.features_extractor(obs)
         q_input = torch.cat([features, action], dim=1)
@@ -249,14 +227,7 @@ class TD3Policy(nn.Module):
     TD3 完整六网络容器：包含 actor, actor_target, critic (qf0+qf1), critic_target (qf0+qf1)。
     """
 
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-        net_arch: dict[str, list[int]],
-    ) -> None:
+    def __init__(self, obs_dim, action_dim, action_low, action_high, net_arch):
         super().__init__()
         pi_arch = net_arch.get("pi", [256, 256])
         qf_arch = net_arch.get("qf", [256, 256])
@@ -269,7 +240,7 @@ class TD3Policy(nn.Module):
         self.critic_target = ContinuousCritic(obs_dim, action_dim, qf_arch)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-    def predict(self, obs: np.ndarray, deterministic: bool = True) -> tuple[np.ndarray, None]:
+    def predict(self, obs, deterministic=True):
         """推理接口：直接使用 Actor 输出确定性连续动作 μ(s)。"""
         device = next(self.parameters()).device
         with torch.no_grad():
@@ -279,15 +250,15 @@ class TD3Policy(nn.Module):
 
 
 def evaluate_policy(
-    policy: TD3Policy,
-    eval_env: gym.Env,
-    n_eval_episodes: int = 10,
-    deterministic: bool = True,
-    return_episode_rewards: bool = False,
-) -> tuple[float, float] | tuple[list[float], list[int]]:
+    policy,
+    eval_env,
+    n_eval_episodes=10,
+    deterministic=True,
+    return_episode_rewards=False,
+):
     """在独立 eval_env 上运行 n_eval_episodes 个完整回合，返回平均奖励与标准差。"""
-    episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
+    episode_rewards = []
+    episode_lengths = []
 
     for _ in range(n_eval_episodes):
         obs, _ = eval_env.reset()
@@ -308,7 +279,7 @@ def evaluate_policy(
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
 
-def main() -> None:
+def main():
     args = parse_args()
     set_seed(args.seed)
     env_id = "Pendulum-v1"
@@ -317,8 +288,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "td3_pendulum"
     log_dir = base_dir / "logs" / "td3_pendulum"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    reset_dir(model_dir)
+    reset_dir(log_dir)
 
     # ==========================================================================
     # 第 1 步：环境初始化与连续动作空间剖析
@@ -405,14 +376,15 @@ def main() -> None:
     best_mean_reward = -float("inf")
     best_model_path = model_dir / "best_model.pt"
 
-    tb_run_dir = get_next_run_dir(log_dir, "TD3_Pendulum")
+    tb_run_dir = log_dir / "TD3_Pendulum"
+    tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps: list[int] = []
-    eval_results: list[list[float]] = []
-    eval_ep_lengths: list[list[int]] = []
-    recent_ep_rewards: list[float] = []
-    recent_ep_lengths: list[int] = []
+    eval_timesteps = []
+    eval_results = []
+    eval_ep_lengths = []
+    recent_ep_rewards = []
+    recent_ep_lengths = []
 
     obs, _ = train_env.reset(seed=args.seed)
     episode_steps = 0
@@ -445,8 +417,8 @@ def main() -> None:
                 writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
 
             if global_step > learning_starts:
-                actor_losses: list[float] = []
-                critic_losses: list[float] = []
+                actor_losses = []
+                critic_losses = []
                 for _ in range(episode_steps):
                     total_grad_updates += 1
                     batch = replay_buffer.sample(batch_size)

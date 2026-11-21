@@ -38,6 +38,7 @@ CleanRL 实战教程 04：SAC (Soft Actor-Critic) 求解 Pendulum-v1
 
 import argparse
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -56,7 +57,7 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数（与 SB3 04_sac_pendulum.py 完全一致）。"""
     parser = argparse.ArgumentParser(description="CleanRL SAC 求解 Pendulum-v1 连续控制示例")
     parser.add_argument(
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     """固定随机种子，保证实验结果可复现。"""
     random.seed(seed)
     np.random.seed(seed)
@@ -78,14 +79,11 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_next_run_dir(log_dir: Path, tb_log_name: str) -> Path:
-    """模仿 SB3 自动递增生成 TensorBoard 子目录（如 SAC_Pendulum_1）。"""
-    idx = 1
-    while (log_dir / f"{tb_log_name}_{idx}").exists():
-        idx += 1
-    run_dir = log_dir / f"{tb_log_name}_{idx}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+def reset_dir(dir_path):
+    """清空并重建目录，确保每次运行只保留最新一次记录或模型。"""
+    if dir_path.exists():
+        shutil.rmtree(dir_path)
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 
 # ==============================================================================
@@ -100,13 +98,7 @@ class ReplayBufferSamples(NamedTuple):
 
 
 class ReplayBuffer:
-    def __init__(
-        self,
-        buffer_size: int,
-        obs_shape: tuple[int, ...],
-        action_dim: int,
-        device: torch.device,
-    ) -> None:
+    def __init__(self, buffer_size, obs_shape, action_dim, device):
         self.buffer_size = buffer_size
         self.device = device
         self.pos = 0
@@ -118,14 +110,7 @@ class ReplayBuffer:
         self.rewards = np.zeros((buffer_size, 1), dtype=np.float32)
         self.dones = np.zeros((buffer_size, 1), dtype=np.float32)
 
-    def add(
-        self,
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        action: np.ndarray,
-        reward: float,
-        terminated: bool,
-    ) -> None:
+    def add(self, obs, next_obs, action, reward, terminated):
         self.observations[self.pos] = obs
         self.next_observations[self.pos] = next_obs
         self.actions[self.pos] = action
@@ -137,7 +122,7 @@ class ReplayBuffer:
             self.full = True
             self.pos = 0
 
-    def sample(self, batch_size: int) -> ReplayBufferSamples:
+    def sample(self, batch_size):
         upper_bound = self.buffer_size if self.full else self.pos
         batch_inds = np.random.randint(0, upper_bound, size=batch_size)
         return ReplayBufferSamples(
@@ -161,17 +146,10 @@ class Actor(nn.Module):
     - 重参数化采样 (Reparameterization Trick) + Tanh 压缩 + 雅可比行列式对数概率修正。
     """
 
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        pi_arch: list[int],
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-    ) -> None:
+    def __init__(self, obs_dim, action_dim, pi_arch, action_low, action_high):
         super().__init__()
         self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-        layers: list[nn.Module] = []
+        layers = []
         in_dim = obs_dim
         for h_dim in pi_arch:
             layers.append(nn.Linear(in_dim, h_dim))
@@ -192,14 +170,14 @@ class Actor(nn.Module):
             torch.tensor((action_high + action_low) / 2.0, dtype=torch.float32),
         )
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs):
         features = self.features_extractor(obs)
         latent = self.latent_pi(features)
         mean = self.mu(latent)
         log_std = torch.clamp(self.log_std(latent), LOG_STD_MIN, LOG_STD_MAX)
         return mean, log_std
 
-    def get_action_and_log_prob(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_action_and_log_prob(self, obs):
         """
         核心数学步骤：
         1. 从无界高斯分布 N(μ(s), σ(s)^2) 中使用 rsample() 重参数化采样 u = μ(s) + σ(s) * ε；
@@ -221,7 +199,7 @@ class Actor(nn.Module):
         log_prob = log_prob.sum(dim=1, keepdim=True)
         return action, log_prob
 
-    def get_deterministic_action(self, obs: torch.Tensor) -> torch.Tensor:
+    def get_deterministic_action(self, obs):
         """评估/推理时直接输出 tanh(μ(s)) 映射后的确定性均值动作，消除随机采样抖动。"""
         mean, _ = self(obs)
         return torch.tanh(mean) * self.action_scale + self.action_bias
@@ -230,12 +208,12 @@ class Actor(nn.Module):
 class ContinuousCritic(nn.Module):
     """截断双 Q 价值网络组 (qf0 与 qf1)，输入维度为 dim(S) + dim(A)。"""
 
-    def __init__(self, obs_dim: int, action_dim: int, qf_arch: list[int]) -> None:
+    def __init__(self, obs_dim, action_dim, qf_arch):
         super().__init__()
         self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
 
-        def build_q_net() -> nn.Sequential:
-            layers: list[nn.Module] = []
+        def build_q_net():
+            layers = []
             in_dim = obs_dim + action_dim
             for h_dim in qf_arch:
                 layers.append(nn.Linear(in_dim, h_dim))
@@ -247,7 +225,7 @@ class ContinuousCritic(nn.Module):
         self.qf0 = build_q_net()
         self.qf1 = build_q_net()
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs, action):
         features = self.features_extractor(obs)
         q_input = torch.cat([features, action], dim=1)
         return self.qf0(q_input), self.qf1(q_input)
@@ -259,14 +237,7 @@ class SACPolicy(nn.Module):
     包含随机策略网络 actor、双主价值网络 critic (qf0+qf1)、双目标价值网络 critic_target (qf0+qf1)。
     """
 
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-        net_arch: dict[str, list[int]],
-    ) -> None:
+    def __init__(self, obs_dim, action_dim, action_low, action_high, net_arch):
         super().__init__()
         pi_arch = net_arch.get("pi", [256, 256])
         qf_arch = net_arch.get("qf", [256, 256])
@@ -276,7 +247,7 @@ class SACPolicy(nn.Module):
         self.critic_target = ContinuousCritic(obs_dim, action_dim, qf_arch)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-    def predict(self, obs: np.ndarray, deterministic: bool = True) -> tuple[np.ndarray, None]:
+    def predict(self, obs, deterministic=True):
         """与 SB3 完全一致的推理接口：deterministic=True 时返回 tanh(μ(s)) 均值动作。"""
         device = next(self.parameters()).device
         with torch.no_grad():
@@ -289,15 +260,15 @@ class SACPolicy(nn.Module):
 
 
 def evaluate_policy(
-    policy: SACPolicy,
-    eval_env: gym.Env,
-    n_eval_episodes: int = 10,
-    deterministic: bool = True,
-    return_episode_rewards: bool = False,
-) -> tuple[float, float] | tuple[list[float], list[int]]:
+    policy,
+    eval_env,
+    n_eval_episodes=10,
+    deterministic=True,
+    return_episode_rewards=False,
+):
     """在独立 eval_env 上运行 n_eval_episodes 个完整回合，返回平均奖励与标准差。"""
-    episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
+    episode_rewards = []
+    episode_lengths = []
 
     for _ in range(n_eval_episodes):
         obs, _ = eval_env.reset()
@@ -318,7 +289,7 @@ def evaluate_policy(
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
 
-def main() -> None:
+def main():
     args = parse_args()
     set_seed(args.seed)
     env_id = "Pendulum-v1"
@@ -327,8 +298,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "sac_pendulum"
     log_dir = base_dir / "logs" / "sac_pendulum"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    reset_dir(model_dir)
+    reset_dir(log_dir)
 
     # ==========================================================================
     # 第 1 步：环境初始化与空间剖析
@@ -411,14 +382,15 @@ def main() -> None:
     best_mean_reward = -float("inf")
     best_model_path = model_dir / "best_model.pt"
 
-    tb_run_dir = get_next_run_dir(log_dir, "SAC_Pendulum")
+    tb_run_dir = log_dir / "SAC_Pendulum"
+    tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps: list[int] = []
-    eval_results: list[list[float]] = []
-    eval_ep_lengths: list[list[int]] = []
-    recent_ep_rewards: list[float] = []
-    recent_ep_lengths: list[int] = []
+    eval_timesteps = []
+    eval_results = []
+    eval_ep_lengths = []
+    recent_ep_rewards = []
+    recent_ep_lengths = []
 
     obs, _ = train_env.reset(seed=args.seed)
     start_time = time.time()

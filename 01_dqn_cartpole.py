@@ -39,6 +39,7 @@ DQN 更新网络时的目标值（TD Target）计算公式为：
 
 import argparse
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -52,7 +53,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数，方便指定训练总步数与随机种子（与 SB3 脚本参数完全一致）。"""
     parser = argparse.ArgumentParser(description="CleanRL DQN 训练 CartPole-v1 示例")
     parser.add_argument(
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     """固定 Python、NumPy 与 PyTorch 随机种子，保证实验结果可复现。"""
     random.seed(seed)
     np.random.seed(seed)
@@ -74,14 +75,11 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_next_run_dir(log_dir: Path, tb_log_name: str) -> Path:
-    """模仿 SB3 自动递增生成 TensorBoard 子目录（如 DQN_CartPole_1, DQN_CartPole_2）。"""
-    idx = 1
-    while (log_dir / f"{tb_log_name}_{idx}").exists():
-        idx += 1
-    run_dir = log_dir / f"{tb_log_name}_{idx}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+def reset_dir(dir_path):
+    """清空并重建目录，确保每次运行只保留最新一次记录或模型。"""
+    if dir_path.exists():
+        shutil.rmtree(dir_path)
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 
 # ==============================================================================
@@ -99,12 +97,7 @@ class ReplayBufferSamples(NamedTuple):
 class ReplayBuffer:
     """固定容量的环形经验回放池，存储 (s, a, r, s', terminated) 五元组转移样本。"""
 
-    def __init__(
-        self,
-        buffer_size: int,
-        obs_shape: tuple[int, ...],
-        device: torch.device,
-    ) -> None:
+    def __init__(self, buffer_size, obs_shape, device):
         self.buffer_size = buffer_size
         self.device = device
         self.pos = 0
@@ -116,14 +109,7 @@ class ReplayBuffer:
         self.rewards = np.zeros((buffer_size, 1), dtype=np.float32)
         self.dones = np.zeros((buffer_size, 1), dtype=np.float32)
 
-    def add(
-        self,
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        action: int,
-        reward: float,
-        terminated: bool,
-    ) -> None:
+    def add(self, obs, next_obs, action, reward, terminated):
         """写入一条单步转移经验；注意 done 仅记录真实终止 terminated（超时截断 truncated 不置零）。"""
         self.observations[self.pos] = obs
         self.next_observations[self.pos] = next_obs
@@ -136,7 +122,7 @@ class ReplayBuffer:
             self.full = True
             self.pos = 0
 
-    def sample(self, batch_size: int) -> ReplayBufferSamples:
+    def sample(self, batch_size):
         """均匀随机采样 batch_size 条经验并转换为 PyTorch 张量。"""
         upper_bound = self.buffer_size if self.full else self.pos
         batch_inds = np.random.randint(0, upper_bound, size=batch_size)
@@ -159,10 +145,10 @@ class QNetwork(nn.Module):
     注意：隐藏层使用 ReLU 激活，输出层绝不能加激活函数（因为 Q 值可能是任意实数）。
     """
 
-    def __init__(self, obs_dim: int, n_actions: int, net_arch: list[int]) -> None:
+    def __init__(self, obs_dim, n_actions, net_arch):
         super().__init__()
         self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-        layers: list[nn.Module] = []
+        layers = []
         in_dim = obs_dim
         for hidden_dim in net_arch:
             layers.append(nn.Linear(in_dim, hidden_dim))
@@ -171,7 +157,7 @@ class QNetwork(nn.Module):
         layers.append(nn.Linear(in_dim, n_actions))
         self.q_net = nn.Sequential(*layers)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs):
         features = self.features_extractor(obs)
         return self.q_net(features)
 
@@ -180,10 +166,15 @@ class DQNPolicy(nn.Module):
     """
     包含主 Q 网络 (q_net) 与目标 Q 网络 (q_net_target) 的完整策略容器。
     提供与 SB3 完全一致的 `.predict(obs, deterministic=True)` 推理接口。
+    4 维状态输入 -> 128(ReLU) -> 128(ReLU) -> 2 个 Q 值输出
     """
 
-    def __init__(self, obs_dim: int, n_actions: int, net_arch: list[int]) -> None:
+    def __init__(self, obs_dim, n_actions, net_arch):
         super().__init__()
+        '''
+        每次创建时 PyTorch 都会随机生成一套初始权重，
+        所以这两个网络刚建好时内部参数是不同的，需要手动同步一次起点。
+        '''
         self.q_net = QNetwork(obs_dim, n_actions, net_arch)
         self.q_net_target = QNetwork(obs_dim, n_actions, net_arch)
         # 初始时刻将主网络权重完整复制到目标网络
@@ -191,11 +182,11 @@ class DQNPolicy(nn.Module):
 
     def predict(
         self,
-        obs: np.ndarray,
-        deterministic: bool = True,
-        epsilon: float = 0.0,
-        action_space: gym.Space | None = None,
-    ) -> tuple[int, None]:
+        obs,
+        deterministic=True,
+        epsilon=0.0,
+        action_space=None,
+    ):
         """根据当前观测选择动作：评估时 deterministic=True 贪婪选最大 Q 值；训练时按 ε-greedy 探索。"""
         if not deterministic and random.random() < epsilon:
             assert action_space is not None
@@ -209,25 +200,25 @@ class DQNPolicy(nn.Module):
         return action, None
 
 
-def linear_schedule(initial_eps: float, final_eps: float, duration: int, current_step: int) -> float:
+def linear_schedule(initial_eps, final_eps, duration, current_step):
     """计算 ε-greedy 的线性衰减探索率 ε。"""
     slope = (final_eps - initial_eps) / max(1, duration)
     return max(final_eps, initial_eps + slope * current_step)
 
 
 def evaluate_policy(
-    policy: DQNPolicy,
-    eval_env: gym.Env,
-    n_eval_episodes: int = 10,
-    deterministic: bool = True,
-    return_episode_rewards: bool = False,
-) -> tuple[float, float] | tuple[list[float], list[int]]:
+    policy,
+    eval_env,
+    n_eval_episodes=10,
+    deterministic=True,
+    return_episode_rewards=False,
+):
     """
     CleanRL 白盒实现的策略评估函数（对应 SB3 `evaluate_policy`）：
     在独立的 eval_env 上运行 n_eval_episodes 个完整回合，返回平均奖励与标准差。
     """
-    episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
+    episode_rewards = []
+    episode_lengths = []
 
     for ep in range(n_eval_episodes):
         obs, _ = eval_env.reset()
@@ -248,7 +239,7 @@ def evaluate_policy(
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
 
-def main() -> None:
+def main():
     args = parse_args()
     set_seed(args.seed)
     env_id = "CartPole-v1"
@@ -258,8 +249,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "dqn_cartpole"
     log_dir = base_dir / "logs" / "dqn_cartpole"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    reset_dir(model_dir)
+    reset_dir(log_dir)
 
     # ==========================================================================
     # 第 1 步：环境初始化与空间剖析
@@ -335,19 +326,20 @@ def main() -> None:
     best_mean_reward = -float("inf")
     best_model_path = model_dir / "best_model.pt"
 
-    tb_run_dir = get_next_run_dir(log_dir, "DQN_CartPole")
+    tb_run_dir = log_dir / "DQN_CartPole"
+    tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
     # 用于保存与 SB3 EvalCallback 完全兼容的 evaluations.npz 记录
-    eval_timesteps: list[int] = []
-    eval_results: list[list[float]] = []
-    eval_ep_lengths: list[list[int]] = []
+    eval_timesteps = []
+    eval_results = []
+    eval_ep_lengths = []
 
     obs, _ = train_env.reset(seed=args.seed)
     start_time = time.time()
     exploration_duration = int(exploration_fraction * args.timesteps)
-    recent_ep_rewards: list[float] = []
-    recent_ep_lengths: list[int] = []
+    recent_ep_rewards = []
+    recent_ep_lengths = []
 
     for global_step in range(1, args.timesteps + 1):
         # 1. 计算当前步的 ε-greedy 探索率并选择动作

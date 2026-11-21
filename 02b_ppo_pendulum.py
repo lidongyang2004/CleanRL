@@ -45,9 +45,9 @@ CleanRL 实战教程 02b：PPO (Proximal Policy Optimization) 求解 Pendulum-v1
 
 import argparse
 import random
+import shutil
 import time
 from pathlib import Path
-from typing import Callable
 
 import gymnasium as gym
 import numpy as np
@@ -59,7 +59,7 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     """解析命令行参数（与 SB3 02b_ppo_pendulum.py 完全一致）。"""
     parser = argparse.ArgumentParser(description="CleanRL PPO 求解 Pendulum-v1 连续动作控制示例")
     parser.add_argument(
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     """固定随机种子，保证实验结果可复现。"""
     random.seed(seed)
     np.random.seed(seed)
@@ -87,21 +87,18 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_next_run_dir(log_dir: Path, tb_log_name: str) -> Path:
-    """模仿 SB3 自动递增生成 TensorBoard 子目录（如 PPO_Pendulum_1 或 PPO_Pendulum_gSDE_1）。"""
-    idx = 1
-    while (log_dir / f"{tb_log_name}_{idx}").exists():
-        idx += 1
-    run_dir = log_dir / f"{tb_log_name}_{idx}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+def reset_dir(dir_path):
+    """清空并重建目录，确保每次运行只保留最新一次记录或模型。"""
+    if dir_path.exists():
+        shutil.rmtree(dir_path)
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 
-def make_vec_env(env_id: str, n_envs: int, seed: int) -> gym.vector.SyncVectorEnv:
+def make_vec_env(env_id, n_envs, seed):
     """创建 n_envs 个并行的 Gymnasium 连续控制环境（SAME_STEP 自动重置模式）。"""
 
-    def make_single_env(rank: int) -> Callable[[], gym.Env]:
-        def _init() -> gym.Env:
+    def make_single_env(rank):
+        def _init():
             env = gym.wrappers.RecordEpisodeStatistics(gym.make(env_id))
             env.reset(seed=seed + rank)
             return env
@@ -118,7 +115,7 @@ def make_vec_env(env_id: str, n_envs: int, seed: int) -> gym.vector.SyncVectorEn
 # CleanRL 白盒组件 1：连续动作概率分布 (DiagGaussian vs gSDE) 与 ActorCriticPolicy
 # 严格对应 SB3 `DiagGaussianDistribution` 与 `StateDependentNoiseDistribution`
 # ==============================================================================
-def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     """正交初始化：隐藏层 gain=sqrt(2)，均值输出层 action_net gain=0.01，价值输出层 value_net gain=1.0。"""
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias_const)
@@ -128,9 +125,9 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.
 class MlpExtractor(nn.Module):
     """双分支解耦特征提取主干：policy_net (pi) 负责动作均值，value_net (vf) 负责状态价值。"""
 
-    def __init__(self, obs_dim: int, pi_arch: list[int], vf_arch: list[int]) -> None:
+    def __init__(self, obs_dim, pi_arch, vf_arch):
         super().__init__()
-        pi_layers: list[nn.Module] = []
+        pi_layers = []
         in_dim = obs_dim
         for h_dim in pi_arch:
             pi_layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))
@@ -138,7 +135,7 @@ class MlpExtractor(nn.Module):
             in_dim = h_dim
         self.policy_net = nn.Sequential(*pi_layers)
 
-        vf_layers: list[nn.Module] = []
+        vf_layers = []
         in_dim = obs_dim
         for h_dim in vf_arch:
             vf_layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))
@@ -146,14 +143,14 @@ class MlpExtractor(nn.Module):
             in_dim = h_dim
         self.value_net = nn.Sequential(*vf_layers)
 
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, features):
         return self.policy_net(features), self.value_net(features)
 
 
 class DiagGaussianDistribution:
     """标准对角高斯分布 (use_sde=False)：标准差 σ = exp(log_std) 独立于状态。"""
 
-    def get_std(self, log_std: torch.Tensor) -> torch.Tensor:
+    def get_std(self, log_std):
         return torch.exp(log_std)
 
 
@@ -164,23 +161,23 @@ class StateDependentNoiseDistribution:
     对应条件高斯分布的方差为 Σ(s) = (h_π(s)^2) @ (σ^2)。
     """
 
-    def __init__(self, latent_sde_dim: int, action_dim: int, epsilon: float = 1e-6) -> None:
+    def __init__(self, latent_sde_dim, action_dim, epsilon=1e-6):
         self.latent_sde_dim = latent_sde_dim
         self.action_dim = action_dim
         self.epsilon = epsilon
-        self.exploration_mat: torch.Tensor | None = None
-        self.exploration_matrices: torch.Tensor | None = None
+        self.exploration_mat = None
+        self.exploration_matrices = None
 
-    def get_std(self, log_std: torch.Tensor) -> torch.Tensor:
+    def get_std(self, log_std):
         return torch.exp(log_std)
 
-    def sample_weights(self, log_std: torch.Tensor, batch_size: int = 1) -> None:
+    def sample_weights(self, log_std, batch_size=1):
         std = self.get_std(log_std)
         weights_dist = Normal(torch.zeros_like(std), std)
         self.exploration_mat = weights_dist.rsample()
         self.exploration_matrices = weights_dist.rsample((batch_size,))
 
-    def get_noise(self, latent_sde: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+    def get_noise(self, latent_sde, log_std):
         latent_sde = latent_sde.detach()
         if self.exploration_mat is None or self.exploration_matrices is None:
             self.sample_weights(log_std, batch_size=len(latent_sde))
@@ -197,13 +194,13 @@ class ActorCriticPolicy(nn.Module):
 
     def __init__(
         self,
-        obs_dim: int,
-        action_dim: int,
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-        net_arch: dict[str, list[int]],
-        use_sde: bool = False,
-    ) -> None:
+        obs_dim,
+        action_dim,
+        action_low,
+        action_high,
+        net_arch,
+        use_sde=False,
+    ):
         super().__init__()
         pi_arch = net_arch.get("pi", [64, 64])
         vf_arch = net_arch.get("vf", [64, 64])
@@ -229,19 +226,17 @@ class ActorCriticPolicy(nn.Module):
             self.action_dist = DiagGaussianDistribution()
             self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
 
-    def reset_noise(self, batch_size: int = 1) -> None:
+    def reset_noise(self, batch_size=1):
         """在 gSDE 模式下重新采样状态依赖噪声矩阵 ε_θ。"""
         if self.use_sde and isinstance(self.action_dist, StateDependentNoiseDistribution):
             self.action_dist.sample_weights(self.log_std, batch_size=batch_size)
 
-    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
+    def get_value(self, obs):
         features = self.features_extractor(obs)
         _, latent_vf = self.mlp_extractor(features)
         return self.value_net(latent_vf)
 
-    def get_action_and_value(
-        self, obs: torch.Tensor, action: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_action_and_value(self, obs, action=None):
         """返回 (未裁剪原始高斯动作, 对数似然 log_prob, 分布熵 entropy, 状态价值 value)。"""
         features = self.features_extractor(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
@@ -266,7 +261,7 @@ class ActorCriticPolicy(nn.Module):
         entropy = dist.entropy().sum(dim=-1)
         return action, log_prob, entropy, self.value_net(latent_vf)
 
-    def predict(self, obs: np.ndarray, deterministic: bool = True) -> tuple[np.ndarray, None]:
+    def predict(self, obs, deterministic=True):
         """
         与 SB3 完全一致的连续动作推理接口：
         - deterministic=True 时直接输出高斯均值 μ(s) 并裁剪至环境动作边界 [low, high]；
@@ -291,7 +286,7 @@ class ActorCriticPolicy(nn.Module):
             return clipped_actions.cpu().numpy(), None
 
 
-def format_policy_std(policy: ActorCriticPolicy) -> str:
+def format_policy_std(policy):
     """提取并格式化当前策略网络的高斯动作标准差 σ = exp(log_std)，方便观察探索幅度变化。"""
     with torch.no_grad():
         if policy.use_sde:
@@ -312,14 +307,7 @@ def format_policy_std(policy: ActorCriticPolicy) -> str:
 # CleanRL 白盒组件 2：连续动作同策略轨迹缓冲区 (RolloutBuffer)
 # ==============================================================================
 class RolloutBuffer:
-    def __init__(
-        self,
-        n_steps: int,
-        n_envs: int,
-        obs_shape: tuple[int, ...],
-        action_dim: int,
-        device: torch.device,
-    ) -> None:
+    def __init__(self, n_steps, n_envs, obs_shape, action_dim, device):
         self.n_steps = n_steps
         self.n_envs = n_envs
         self.obs_shape = obs_shape
@@ -327,7 +315,7 @@ class RolloutBuffer:
         self.device = device
         self.reset()
 
-    def reset(self) -> None:
+    def reset(self):
         self.observations = np.zeros((self.n_steps, self.n_envs, *self.obs_shape), dtype=np.float32)
         self.actions = np.zeros((self.n_steps, self.n_envs, self.action_dim), dtype=np.float32)
         self.rewards = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
@@ -338,15 +326,7 @@ class RolloutBuffer:
         self.returns = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
         self.pos = 0
 
-    def add(
-        self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        reward: np.ndarray,
-        done: np.ndarray,
-        value: np.ndarray,
-        log_prob: np.ndarray,
-    ) -> None:
+    def add(self, obs, action, reward, done, value, log_prob):
         self.observations[self.pos] = obs
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
@@ -355,9 +335,7 @@ class RolloutBuffer:
         self.log_probs[self.pos] = log_prob
         self.pos += 1
 
-    def compute_returns_and_advantage(
-        self, last_values: np.ndarray, gamma: float, gae_lambda: float
-    ) -> None:
+    def compute_returns_and_advantage(self, last_values, gamma, gae_lambda):
         last_gae_lam = np.zeros(self.n_envs, dtype=np.float32)
         for step in reversed(range(self.n_steps)):
             if step == self.n_steps - 1:
@@ -372,15 +350,15 @@ class RolloutBuffer:
 
 
 def evaluate_policy(
-    policy: ActorCriticPolicy,
-    eval_env: gym.Env,
-    n_eval_episodes: int = 10,
-    deterministic: bool = True,
-    return_episode_rewards: bool = False,
-) -> tuple[float, float] | tuple[list[float], list[int]]:
+    policy,
+    eval_env,
+    n_eval_episodes=10,
+    deterministic=True,
+    return_episode_rewards=False,
+):
     """在独立 eval_env 上运行 n_eval_episodes 个完整回合，返回平均奖励与标准差。"""
-    episode_rewards: list[float] = []
-    episode_lengths: list[int] = []
+    episode_rewards = []
+    episode_lengths = []
 
     for _ in range(n_eval_episodes):
         obs, _ = eval_env.reset()
@@ -401,7 +379,7 @@ def evaluate_policy(
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
 
-def main() -> None:
+def main():
     args = parse_args()
     set_seed(args.seed)
     env_id = "Pendulum-v1"
@@ -410,8 +388,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "ppo_pendulum"
     log_dir = base_dir / "logs" / "ppo_pendulum"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    reset_dir(model_dir)
+    reset_dir(log_dir)
 
     # ==========================================================================
     # 第 1 步：创建矢量化并行连续控制环境与空间剖析
@@ -503,14 +481,15 @@ def main() -> None:
     best_model_path = model_dir / "best_model.pt"
 
     tb_log_name = "PPO_Pendulum_gSDE" if use_sde else "PPO_Pendulum"
-    tb_run_dir = get_next_run_dir(log_dir, tb_log_name)
+    tb_run_dir = log_dir / tb_log_name
+    tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps: list[int] = []
-    eval_results: list[list[float]] = []
-    eval_ep_lengths: list[list[int]] = []
-    recent_ep_rewards: list[float] = []
-    recent_ep_lengths: list[int] = []
+    eval_timesteps = []
+    eval_results = []
+    eval_ep_lengths = []
+    recent_ep_rewards = []
+    recent_ep_lengths = []
 
     obs, _ = train_env.reset(seed=args.seed)
     global_step = 0
