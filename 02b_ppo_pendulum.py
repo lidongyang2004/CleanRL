@@ -122,29 +122,16 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class MlpExtractor(nn.Module):
-    """双分支解耦特征提取主干：policy_net (pi) 负责动作均值，value_net (vf) 负责状态价值。"""
-
-    def __init__(self, obs_dim, pi_arch, vf_arch):
-        super().__init__()
-        pi_layers = []
-        in_dim = obs_dim
-        for h_dim in pi_arch:
-            pi_layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))
-            pi_layers.append(nn.Tanh())
-            in_dim = h_dim
-        self.policy_net = nn.Sequential(*pi_layers)
-
-        vf_layers = []
-        in_dim = obs_dim
-        for h_dim in vf_arch:
-            vf_layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))
-            vf_layers.append(nn.Tanh())
-            in_dim = h_dim
-        self.value_net = nn.Sequential(*vf_layers)
-
-    def forward(self, features):
-        return self.policy_net(features), self.value_net(features)
+def _build_mlp(in_dim, hidden_dims, out_dim=None, out_std=1.0):
+    """构建带 Tanh 激活与正交初始化的多层感知机（当 out_dim=None 时仅返回隐藏层特征主干）。"""
+    layers = []
+    for h_dim in hidden_dims:
+        layers.append(layer_init(nn.Linear(in_dim, h_dim), std=np.sqrt(2)))  # 隐藏层用 sqrt(2) 补偿 Tanh 压缩
+        layers.append(nn.Tanh())
+        in_dim = h_dim
+    if out_dim is not None:
+        layers.append(layer_init(nn.Linear(in_dim, out_dim), std=out_std))
+    return nn.Sequential(*layers)
 
 
 class DiagGaussianDistribution:
@@ -189,7 +176,9 @@ class StateDependentNoiseDistribution:
 
 class ActorCriticPolicy(nn.Module):
     """
-    连续动作空间 Actor-Critic 策略网络（同时支持标准对角高斯与 gSDE 状态依赖探索）。
+    连续动作空间 Actor-Critic 策略网络（同时支持标准对角高斯与 gSDE 状态依赖探索）：
+    - self.actor_backbone + self.actor_mean: (batch, obs_dim) -> (batch, 64) -> (batch, action_dim) 输出高斯均值 μ(s)
+    - self.critic: (batch, obs_dim) -> (batch, 1) 输出状态价值估计 v(s, w)
     """
 
     def __init__(
@@ -211,10 +200,10 @@ class ActorCriticPolicy(nn.Module):
         self.register_buffer("action_low", torch.tensor(action_low, dtype=torch.float32))
         self.register_buffer("action_high", torch.tensor(action_high, dtype=torch.float32))
 
-        self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-        self.mlp_extractor = MlpExtractor(obs_dim, pi_arch=pi_arch, vf_arch=vf_arch)
-        self.action_net = layer_init(nn.Linear(self.latent_dim_pi, action_dim), std=0.01)
-        self.value_net = layer_init(nn.Linear(vf_arch[-1], 1), std=1.0)
+        self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
+        self.actor_backbone = _build_mlp(obs_dim, pi_arch, out_dim=None)
+        self.actor_mean = layer_init(nn.Linear(self.latent_dim_pi, action_dim), std=0.01)  # 初始均值接近 0
+        self.critic = _build_mlp(obs_dim, vf_arch, out_dim=1, out_std=1.0)
 
         if self.use_sde:
             # gSDE 模式下：log_std 是形状为 (64, action_dim) 的状态特征噪声矩阵参数（初始为 0.0）
@@ -232,15 +221,17 @@ class ActorCriticPolicy(nn.Module):
             self.action_dist.sample_weights(self.log_std, batch_size=batch_size)
 
     def get_value(self, obs):
-        features = self.features_extractor(obs)
-        _, latent_vf = self.mlp_extractor(features)
-        return self.value_net(latent_vf)
+        """对应伪代码价值函数 v(s, w_k)：仅计算状态价值，形状 (batch_size, 1)。"""
+        return self.critic(self.flatten(obs))
 
     def get_action_and_value(self, obs, action=None):
-        """返回 (未裁剪原始高斯动作, 对数似然 log_prob, 分布熵 entropy, 状态价值 value)。"""
-        features = self.features_extractor(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
-        mean_actions = self.action_net(latent_pi)
+        """
+        连续动作四合一前向接口（同时覆盖伪代码第 1 步采样与第 3 步重评估）：
+        返回 (未裁剪原始高斯动作 action, 对数似然 log_prob, 分布熵 entropy, 状态价值 value)。
+        """
+        features = self.flatten(obs)
+        latent_pi = self.actor_backbone(features)
+        mean_actions = self.actor_mean(latent_pi)  # 高斯分布均值 μ(s)
 
         if self.use_sde and isinstance(self.action_dist, StateDependentNoiseDistribution):
             latent_sde = latent_pi.detach()
@@ -251,7 +242,7 @@ class ActorCriticPolicy(nn.Module):
                 noise = self.action_dist.get_noise(latent_sde, self.log_std)
                 action = mean_actions + noise
         else:
-            action_std = torch.exp(self.log_std).expand_as(mean_actions)
+            action_std = torch.exp(self.log_std).expand_as(mean_actions)  # 标准差 σ = exp(log_std)
             dist = Normal(mean_actions, action_std)
             if action is None:
                 action = dist.sample()
@@ -259,11 +250,11 @@ class ActorCriticPolicy(nn.Module):
         # 多维独立高斯分布的联合对数概率等于各维度 log_prob 之和
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        return action, log_prob, entropy, self.value_net(latent_vf)
+        return action, log_prob, entropy, self.critic(features)
 
     def predict(self, obs, deterministic=True):
         """
-        与 SB3 完全一致的连续动作推理接口：
+        连续动作评估/演示推理接口：
         - deterministic=True 时直接输出高斯均值 μ(s) 并裁剪至环境动作边界 [low, high]；
         - deterministic=False 时从高斯分布采样并裁剪。
         """
@@ -273,13 +264,12 @@ class ActorCriticPolicy(nn.Module):
             single_env = obs_tensor.ndim == 1
             if single_env:
                 obs_tensor = obs_tensor.unsqueeze(0)
-            features = self.features_extractor(obs_tensor)
-            latent_pi, _ = self.mlp_extractor(features)
-            mean_actions = self.action_net(latent_pi)
+
             if deterministic:
-                raw_actions = mean_actions
+                raw_actions = self.actor_mean(self.actor_backbone(self.flatten(obs_tensor)))
             else:
                 raw_actions, _, _, _ = self.get_action_and_value(obs_tensor)
+
             clipped_actions = torch.clamp(raw_actions, self.action_low, self.action_high)
             if single_env:
                 return clipped_actions.squeeze(0).cpu().numpy(), None
@@ -377,6 +367,225 @@ def evaluate_policy(
     if return_episode_rewards:
         return episode_rewards, episode_lengths
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
+
+
+def bootstrap_truncated_rewards(rewards, terminations, truncations, infos, policy, gamma, device):
+    """
+    超时截断 (truncated=True 且 terminated=False) 的自举价值修正：
+    Pendulum-v1 固定在 200 步触发 truncated=True，必须将终态价值 γ * V(s_final) 加回本步奖励。
+    """
+    step_rewards = rewards.astype(np.float32).copy()
+    for idx in range(len(step_rewards)):
+        if not (truncations[idx] and not terminations[idx]):
+            continue
+        final_obs = None
+        if "final_obs" in infos and infos["final_obs"][idx] is not None:
+            final_obs = infos["final_obs"][idx]
+        elif "final_observation" in infos and infos["final_observation"][idx] is not None:
+            final_obs = infos["final_observation"][idx]
+        if final_obs is not None:
+            with torch.no_grad():
+                final_obs_t = torch.as_tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
+                terminal_v = float(policy.get_value(final_obs_t).item())
+            step_rewards[idx] += gamma * terminal_v
+    return step_rewards
+
+
+def record_episode_stats(infos, n_envs, recent_ep_rewards, recent_ep_lengths):
+    """从并行环境的 infos 中提取已完成回合的总奖励与步数。"""
+    ep_source = infos["final_info"] if ("final_info" in infos and "episode" in infos["final_info"]) else infos
+    if "episode" not in ep_source:
+        return
+    ep_info = ep_source["episode"]
+    mask = ep_source.get("_episode", np.ones(n_envs, dtype=bool))
+    for idx in range(n_envs):
+        if mask[idx]:
+            recent_ep_rewards.append(float(ep_info["r"][idx]))
+            recent_ep_lengths.append(int(ep_info["l"][idx]))
+
+
+def maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer):
+    """定期在独立 eval_env 上评估当前策略，记录 evaluations.npz 并在创新高时保存 best_model.pt。"""
+    ep_rewards, ep_lengths = evaluate_policy(
+        policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
+    )
+    eval_mean = float(np.mean(ep_rewards))
+    eval_std = float(np.std(ep_rewards))
+
+    eval_state["timesteps"].append(global_step)
+    eval_state["results"].append(ep_rewards)
+    eval_state["ep_lengths"].append(ep_lengths)
+    np.savez(
+        log_dir / "evaluations.npz",
+        timesteps=np.array(eval_state["timesteps"]),
+        results=np.array(eval_state["results"]),
+        ep_lengths=np.array(eval_state["ep_lengths"]),
+    )
+    writer.add_scalar("eval/mean_reward", eval_mean, global_step)
+    writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
+    print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
+
+    if eval_mean > eval_state["best_mean_reward"]:
+        eval_state["best_mean_reward"] = eval_mean
+        torch.save(policy.state_dict(), eval_state["best_model_path"])
+        print(f"    --> 刷新最高评估记录！已保存最优模型至: {eval_state['best_model_path']}")
+
+
+def collect_rollouts(
+    train_env,
+    eval_env,
+    policy,
+    rollout_buffer,
+    obs,
+    global_step,
+    vec_step_count,
+    n_steps,
+    n_envs,
+    act_space,
+    use_sde,
+    sde_sample_freq,
+    gamma,
+    gae_lambda,
+    device,
+    eval_freq_vec_steps,
+    eval_state,
+    log_dir,
+    writer,
+    recent_ep_rewards,
+    recent_ep_lengths,
+):
+    """
+    对应 PPO 伪代码【第 1 步 + 第 2 步】：
+    1. 用当前连续高斯策略 π(·|s, θ_k) 并行采样 n_steps 步（原始动作存入 Buffer，裁剪动作送入环境）；
+    2. 采样结束后用 v(s_T, w_k) 引导，通过 GAE 计算优势 A_t 与回报目标 R_t。
+    """
+    rollout_buffer.reset()
+    if use_sde:
+        policy.reset_noise(n_envs)
+
+    for step_idx in range(n_steps):
+        vec_step_count += 1
+        global_step += n_envs
+
+        if use_sde and sde_sample_freq > 0 and step_idx % sde_sample_freq == 0:
+            policy.reset_noise(n_envs)
+
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            raw_actions, log_probs, _, values = policy.get_action_and_value(obs_tensor)
+
+        # 存入 Buffer 的是未裁剪的原始高斯动作 raw_actions（与 log_prob 精确对应），
+        # 传给物理环境 step() 的是裁剪到 [-2.0, 2.0] 的合法力矩 clipped_actions
+        raw_actions_np = raw_actions.cpu().numpy()
+        clipped_actions_np = np.clip(raw_actions_np, act_space.low, act_space.high)
+
+        next_obs, rewards, terminations, truncations, infos = train_env.step(clipped_actions_np)
+        dones = np.logical_or(terminations, truncations)
+
+        step_rewards = bootstrap_truncated_rewards(
+            rewards, terminations, truncations, infos, policy, gamma, device
+        )
+        record_episode_stats(infos, n_envs, recent_ep_rewards, recent_ep_lengths)
+
+        rollout_buffer.add(
+            obs=obs,
+            action=raw_actions_np,
+            reward=step_rewards,
+            done=dones.astype(np.float32),
+            value=values.flatten().cpu().numpy(),
+            log_prob=log_probs.cpu().numpy(),
+        )
+        obs = next_obs
+
+        if vec_step_count % eval_freq_vec_steps == 0:
+            maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer)
+
+    with torch.no_grad():
+        next_obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        last_values = policy.get_value(next_obs_tensor).flatten().cpu().numpy()
+    rollout_buffer.compute_returns_and_advantage(
+        last_values=last_values, gamma=gamma, gae_lambda=gae_lambda
+    )
+    return obs, global_step, vec_step_count
+
+
+def update_policy(
+    policy,
+    optimizer,
+    rollout_buffer,
+    action_dim,
+    n_epochs,
+    batch_size,
+    use_sde,
+    clip_range,
+    vf_coef,
+    ent_coef,
+    max_grad_norm,
+    device,
+):
+    """对应 PPO 伪代码【第 3 步】：展平轨迹缓冲区并在 n_epochs 轮内执行小批次 PPO-Clip 更新。"""
+    buffer_size = rollout_buffer.n_steps * rollout_buffer.n_envs
+    b_obs = torch.as_tensor(rollout_buffer.observations.reshape((-1, *rollout_buffer.obs_shape)), device=device)
+    b_actions = torch.as_tensor(rollout_buffer.actions.reshape((-1, action_dim)), device=device)
+    b_logprobs = torch.as_tensor(rollout_buffer.log_probs.reshape(-1), device=device)
+    b_advantages = torch.as_tensor(rollout_buffer.advantages.reshape(-1), device=device)
+    b_returns = torch.as_tensor(rollout_buffer.returns.reshape(-1), device=device)
+
+    b_inds = np.arange(buffer_size)
+    pg_losses, value_losses, entropy_losses, clip_fractions = [], [], [], []
+
+    for _ in range(n_epochs):
+        if use_sde:
+            policy.reset_noise(batch_size)
+        np.random.shuffle(b_inds)
+        for start in range(0, buffer_size, batch_size):
+            mb_inds = b_inds[start : start + batch_size]
+
+            _, new_logprob, entropy, new_value = policy.get_action_and_value(
+                b_obs[mb_inds], b_actions[mb_inds]
+            )
+            ratio = (new_logprob - b_logprobs[mb_inds]).exp()
+
+            mb_advantages = b_advantages[mb_inds]
+            mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+            pg_loss1 = -mb_advantages * ratio
+            pg_loss2 = -mb_advantages * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            v_loss = F.mse_loss(new_value.flatten(), b_returns[mb_inds])
+            entropy_loss = -entropy.mean()
+            loss = pg_loss + vf_coef * v_loss + ent_coef * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            optimizer.step()
+
+            pg_losses.append(pg_loss.item())
+            value_losses.append(v_loss.item())
+            entropy_losses.append(entropy_loss.item())
+            clip_fractions.append(float((torch.abs(ratio - 1.0) > clip_range).float().mean().item()))
+
+    return {
+        "pg_loss": float(np.mean(pg_losses)),
+        "value_loss": float(np.mean(value_losses)),
+        "entropy_loss": float(np.mean(entropy_losses)),
+        "clip_fraction": float(np.mean(clip_fractions)),
+    }
+
+
+def log_update_metrics(writer, policy, metrics, recent_ep_rewards, recent_ep_lengths, global_step, start_time):
+    """将每轮连续 PPO 更新后的训练统计与标准差写入 TensorBoard。"""
+    if recent_ep_rewards:
+        writer.add_scalar("rollout/ep_rew_mean", float(np.mean(recent_ep_rewards[-100:])), global_step)
+        writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
+    writer.add_scalar("train/policy_gradient_loss", metrics["pg_loss"], global_step)
+    writer.add_scalar("train/value_loss", metrics["value_loss"], global_step)
+    writer.add_scalar("train/entropy_loss", metrics["entropy_loss"], global_step)
+    writer.add_scalar("train/clip_fraction", metrics["clip_fraction"], global_step)
+    writer.add_scalar("train/std", float(torch.exp(policy.log_std).mean().item()), global_step)
+    writer.add_scalar("time/fps", int(global_step / max(1e-6, time.time() - start_time)), global_step)
 
 
 def main():
@@ -477,17 +686,19 @@ def main():
     # ==========================================================================
     print(f"\n[第 4 步] 开始训练连续动作 PPO（总步数 total_timesteps={args.timesteps}）...")
     eval_freq_vec_steps = max(1_000, (args.timesteps // 5) // args.n_envs)
-    best_mean_reward = -float("inf")
-    best_model_path = model_dir / "best_model.pt"
+    eval_state = {
+        "best_mean_reward": -float("inf"),
+        "best_model_path": model_dir / "best_model.pt",
+        "timesteps": [],
+        "results": [],
+        "ep_lengths": [],
+    }
 
     tb_log_name = "PPO_Pendulum_gSDE" if use_sde else "PPO_Pendulum"
     tb_run_dir = log_dir / tb_log_name
     tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps = []
-    eval_results = []
-    eval_ep_lengths = []
     recent_ep_rewards = []
     recent_ep_lengths = []
 
@@ -497,154 +708,51 @@ def main():
     num_updates = max(1, args.timesteps // rollout_buffer_size)
     start_time = time.time()
 
-    for update in range(1, num_updates + 1):
-        # ----------------------------
-        # 阶段 A：并行连续环境采样 (Collect Rollouts)
-        # ----------------------------
-        rollout_buffer.reset()
-        if use_sde:
-            policy.reset_noise(args.n_envs)
-
-        for step_idx in range(n_steps):
-            vec_step_count += 1
-            global_step += args.n_envs
-
-            if use_sde and sde_sample_freq > 0 and step_idx % sde_sample_freq == 0:
-                policy.reset_noise(args.n_envs)
-
-            with torch.no_grad():
-                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
-                raw_actions, log_probs, _, values = policy.get_action_and_value(obs_tensor)
-
-            # 注意：存入 RolloutBuffer 的是未裁剪的原始高斯采样动作 raw_actions（保证 log_prob 精确对应），
-            # 而传给物理环境 step() 的是裁剪到 [-2.0, 2.0] 的合法力矩 clipped_actions（与 SB3 完全一致）
-            raw_actions_np = raw_actions.cpu().numpy()
-            clipped_actions_np = np.clip(raw_actions_np, act_space.low, act_space.high)
-
-            next_obs, rewards, terminations, truncations, infos = train_env.step(clipped_actions_np)
-            dones = np.logical_or(terminations, truncations)
-
-            # 关键细节：Pendulum-v1 总是在 200 步时触发 truncated=True，必须用 final_obs 做自举价值修正！
-            step_rewards = rewards.astype(np.float32).copy()
-            for idx in range(args.n_envs):
-                if truncations[idx] and not terminations[idx]:
-                    final_obs = None
-                    if "final_obs" in infos and infos["final_obs"][idx] is not None:
-                        final_obs = infos["final_obs"][idx]
-                    elif "final_observation" in infos and infos["final_observation"][idx] is not None:
-                        final_obs = infos["final_observation"][idx]
-                    if final_obs is not None:
-                        with torch.no_grad():
-                            final_obs_t = torch.as_tensor(final_obs, dtype=torch.float32, device=device).unsqueeze(0)
-                            terminal_v = float(policy.get_value(final_obs_t).item())
-                        step_rewards[idx] += gamma * terminal_v
-
-            if "final_info" in infos and "episode" in infos["final_info"]:
-                ep_info = infos["final_info"]["episode"]
-                mask = infos["final_info"].get("_episode", np.ones(args.n_envs, dtype=bool))
-                for idx in range(args.n_envs):
-                    if mask[idx]:
-                        recent_ep_rewards.append(float(ep_info["r"][idx]))
-                        recent_ep_lengths.append(int(ep_info["l"][idx]))
-
-            rollout_buffer.add(
-                obs=obs,
-                action=raw_actions_np,
-                reward=step_rewards,
-                done=dones.astype(np.float32),
-                value=values.flatten().cpu().numpy(),
-                log_prob=log_probs.cpu().numpy(),
-            )
-            obs = next_obs
-
-            if vec_step_count % eval_freq_vec_steps == 0:
-                ep_rewards, ep_lengths = evaluate_policy(
-                    policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
-                )
-                eval_mean = float(np.mean(ep_rewards))
-                eval_std = float(np.std(ep_rewards))
-                eval_timesteps.append(global_step)
-                eval_results.append(ep_rewards)
-                eval_ep_lengths.append(ep_lengths)
-                np.savez(
-                    log_dir / "evaluations.npz",
-                    timesteps=np.array(eval_timesteps),
-                    results=np.array(eval_results),
-                    ep_lengths=np.array(eval_ep_lengths),
-                )
-                writer.add_scalar("eval/mean_reward", eval_mean, global_step)
-                writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
-                print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
-                if eval_mean > best_mean_reward:
-                    best_mean_reward = eval_mean
-                    torch.save(policy.state_dict(), best_model_path)
-                    print(f"    --> 刷新最高评估记录！已保存最优模型至: {best_model_path}")
-
-        with torch.no_grad():
-            next_obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
-            last_values = policy.get_value(next_obs_tensor).flatten().cpu().numpy()
-        rollout_buffer.compute_returns_and_advantage(
-            last_values=last_values, gamma=gamma, gae_lambda=gae_lambda
+    for _ in range(1, num_updates + 1):
+        # 阶段 A（伪代码第 1-2 步）：并行连续环境采样 + 计算 GAE 优势与回报目标
+        obs, global_step, vec_step_count = collect_rollouts(
+            train_env=train_env,
+            eval_env=eval_env,
+            policy=policy,
+            rollout_buffer=rollout_buffer,
+            obs=obs,
+            global_step=global_step,
+            vec_step_count=vec_step_count,
+            n_steps=n_steps,
+            n_envs=args.n_envs,
+            act_space=act_space,
+            use_sde=use_sde,
+            sde_sample_freq=sde_sample_freq,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            device=device,
+            eval_freq_vec_steps=eval_freq_vec_steps,
+            eval_state=eval_state,
+            log_dir=log_dir,
+            writer=writer,
+            recent_ep_rewards=recent_ep_rewards,
+            recent_ep_lengths=recent_ep_lengths,
         )
 
-        # ----------------------------
-        # 阶段 B：展平 RolloutBuffer 并执行 n_epochs 轮小批次 PPO-Clip 更新
-        # ----------------------------
-        b_obs = torch.as_tensor(rollout_buffer.observations.reshape((-1, *rollout_buffer.obs_shape)), device=device)
-        b_actions = torch.as_tensor(rollout_buffer.actions.reshape((-1, action_dim)), device=device)
-        b_logprobs = torch.as_tensor(rollout_buffer.log_probs.reshape(-1), device=device)
-        b_advantages = torch.as_tensor(rollout_buffer.advantages.reshape(-1), device=device)
-        b_returns = torch.as_tensor(rollout_buffer.returns.reshape(-1), device=device)
-
-        b_inds = np.arange(rollout_buffer_size)
-        pg_losses, value_losses, entropy_losses, clip_fractions = [], [], [], []
-
-        for _ in range(n_epochs):
-            if use_sde:
-                policy.reset_noise(batch_size)
-            np.random.shuffle(b_inds)
-            for start in range(0, rollout_buffer_size, batch_size):
-                end = start + batch_size
-                mb_inds = b_inds[start:end]
-
-                _, new_logprob, entropy, new_value = policy.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
-                )
-                logratio = new_logprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                mb_advantages = b_advantages[mb_inds]
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                v_loss = F.mse_loss(new_value.flatten(), b_returns[mb_inds])
-                entropy_loss = -entropy.mean()
-                loss = pg_loss + vf_coef * v_loss + ent_coef * entropy_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-                optimizer.step()
-
-                pg_losses.append(pg_loss.item())
-                value_losses.append(v_loss.item())
-                entropy_losses.append(entropy_loss.item())
-                clip_fractions.append(float((torch.abs(ratio - 1.0) > clip_range).float().mean().item()))
-
-        if recent_ep_rewards:
-            writer.add_scalar("rollout/ep_rew_mean", float(np.mean(recent_ep_rewards[-100:])), global_step)
-            writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
-        writer.add_scalar("train/policy_gradient_loss", float(np.mean(pg_losses)), global_step)
-        writer.add_scalar("train/value_loss", float(np.mean(value_losses)), global_step)
-        writer.add_scalar("train/entropy_loss", float(np.mean(entropy_losses)), global_step)
-        writer.add_scalar("train/clip_fraction", float(np.mean(clip_fractions)), global_step)
-        writer.add_scalar("train/std", float(torch.exp(policy.log_std).mean().item()), global_step)
-        writer.add_scalar("time/fps", int(global_step / max(1e-6, time.time() - start_time)), global_step)
+        # 阶段 B（伪代码第 3 步）：小批次 PPO-Clip 联合更新 Actor 与 Critic
+        metrics = update_policy(
+            policy=policy,
+            optimizer=optimizer,
+            rollout_buffer=rollout_buffer,
+            action_dim=action_dim,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            use_sde=use_sde,
+            clip_range=clip_range,
+            vf_coef=vf_coef,
+            ent_coef=ent_coef,
+            max_grad_norm=max_grad_norm,
+            device=device,
+        )
+        log_update_metrics(writer, policy, metrics, recent_ep_rewards, recent_ep_lengths, global_step, start_time)
 
     writer.close()
+    best_model_path = eval_state["best_model_path"]
 
     # ==========================================================================
     # 第 5 步：训练后定量评估与高斯标准差收敛观察

@@ -17,12 +17,20 @@
 
 ## 快速开始
 
-### 1. 激活虚拟环境
+### 1. 创建 / 激活虚拟环境
 
 ```bash
+# 进入项目根目录（当前已在 CleanRL 目录下可跳过此步）
 cd CleanRL
+
+# 若尚未创建 .venv，或移动项目目录后激活失效，可重建并安装依赖：
+# uv venv .venv --python 3.11 && uv pip install -r requirements.txt
+# （或使用系统 python3：python3 -m venv .venv && .venv/bin/pip install -r requirements.txt）
+
 source .venv/bin/activate
 ```
+
+> **注意**：如果移动过项目文件夹，`.venv/bin/activate` 内部记录的旧路径会失效，导致激活后仍提示找不到 `python` 或缺少 `gymnasium`。此时请按上面命令重建 `.venv`，或直接使用 `.venv/bin/python` 运行脚本。
 
 ### 2. 运行四大算法示例
 

@@ -138,28 +138,40 @@ class ReplayBuffer:
 # CleanRL 白盒组件 2：SAC 五网络架构 (Squashed Gaussian Actor + Twin Critic + Target Critic)
 # 严格对应 SB3 `SACPolicy(net_arch=dict(pi=[256, 256], qf=[256, 256]))`
 # ==============================================================================
+def _build_mlp(in_dim, hidden_dims, out_dim=None):
+    """构建带 ReLU 隐藏层的多层感知机（当 out_dim=None 时仅返回隐藏层特征主干）。"""
+    layers = []
+    for h_dim in hidden_dims:
+        layers.append(nn.Linear(in_dim, h_dim))
+        layers.append(nn.ReLU())
+        in_dim = h_dim
+    if out_dim is not None:
+        layers.append(nn.Linear(in_dim, out_dim))
+    return nn.Sequential(*layers)
+
+
+def soft_update(source_net, target_net, tau):
+    """Polyak 目标网络软更新：θ_target ← τ * θ + (1 - τ) * θ_target。"""
+    for param, target_param in zip(source_net.parameters(), target_net.parameters()):
+        target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
+
 class Actor(nn.Module):
     """
-    SAC 随机策略网络（对应 SB3 `SACPolicy.actor`）：
-    - 共享隐藏层 `latent_pi` ([256, 256] + ReLU)；
-    - 状态依赖的双头分叉：`mu` 输出高斯均值 μ(s)，`log_std` 输出状态依赖对数标准差 ln σ(s)；
-    - 重参数化采样 (Reparameterization Trick) + Tanh 压缩 + 雅可比行列式对数概率修正。
+    SAC 随机策略网络（Squashed Gaussian Actor）：
+    - 共享隐藏层 `latent_pi`：(batch, obs_dim) -> [256, 256] (ReLU)
+    - 双头分叉：`mu` 输出高斯均值 μ(s)，`log_std` 输出状态依赖对数标准差 ln σ(s)
+    - 重参数化采样 (Reparameterization Trick) + Tanh 压缩 + 雅可比行列式对数概率修正
     """
 
     def __init__(self, obs_dim, action_dim, pi_arch, action_low, action_high):
         super().__init__()
-        self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-        layers = []
-        in_dim = obs_dim
-        for h_dim in pi_arch:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(nn.ReLU())
-            in_dim = h_dim
-        self.latent_pi = nn.Sequential(*layers)
+        self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
+        self.latent_pi = _build_mlp(obs_dim, pi_arch, out_dim=None)
 
-        # 双头分叉：同时输出均值与对数标准差
-        self.mu = nn.Linear(in_dim, action_dim)
-        self.log_std = nn.Linear(in_dim, action_dim)
+        last_dim = pi_arch[-1]
+        self.mu = nn.Linear(last_dim, action_dim)       # 均值输出头 μ(s)
+        self.log_std = nn.Linear(last_dim, action_dim)  # 对数标准差输出头 ln σ(s)
 
         self.register_buffer(
             "action_scale",
@@ -171,8 +183,7 @@ class Actor(nn.Module):
         )
 
     def forward(self, obs):
-        features = self.features_extractor(obs)
-        latent = self.latent_pi(features)
+        latent = self.latent_pi(self.flatten(obs))
         mean = self.mu(latent)
         log_std = torch.clamp(self.log_std(latent), LOG_STD_MIN, LOG_STD_MAX)
         return mean, log_std
@@ -180,23 +191,19 @@ class Actor(nn.Module):
     def get_action_and_log_prob(self, obs):
         """
         核心数学步骤：
-        1. 从无界高斯分布 N(μ(s), σ(s)^2) 中使用 rsample() 重参数化采样 u = μ(s) + σ(s) * ε；
-        2. 经 y_t = tanh(u) 压缩到 (-1, 1)，再线性仿射变换到 [low, high]；
+        1. 从无界高斯分布 N(μ(s), σ(s)^2) 中使用 rsample() 重参数化采样 x_t = μ(s) + σ(s) * ε；
+        2. 经 y_t = tanh(x_t) 压缩到 (-1, 1)，再线性变换到真实力矩范围 [low, high]；
         3. 计算带雅可比行列式修正的对数概率：
-           log π(a|s) = log N(u; μ, σ^2) - Σ log(action_scale * (1 - tanh(u)^2) + 1e-6)
+           log π(a|s) = log N(x_t; μ, σ^2) - Σ log(action_scale * (1 - tanh(x_t)^2) + 1e-6)
         """
         mean, log_std = self(obs)
-        std = log_std.exp()
-        normal = Normal(mean, std)
-        # rsample() 保持梯度可沿采样路径反向传播至 mean 和 log_std
-        x_t = normal.rsample()
+        normal = Normal(mean, log_std.exp())
+        x_t = normal.rsample()  # rsample() 保持梯度可沿采样路径反向传播至 mean 和 log_std
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
 
-        log_prob = normal.log_prob(x_t)
-        # 减去 Tanh 压缩与线性放缩带来的雅可比对数修正项
-        log_prob -= torch.log(self.action_scale * (1.0 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(dim=1, keepdim=True)
+        log_prob = normal.log_prob(x_t) - torch.log(self.action_scale * (1.0 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(dim=1, keepdim=True)  # (batch, 1)
         return action, log_prob
 
     def get_deterministic_action(self, obs):
@@ -206,28 +213,17 @@ class Actor(nn.Module):
 
 
 class ContinuousCritic(nn.Module):
-    """截断双 Q 价值网络组 (qf0 与 qf1)，输入维度为 dim(S) + dim(A)。"""
+    """截断双 Q 价值网络组 (qf0 与 qf1)，输入维度为 obs_dim + action_dim。"""
 
     def __init__(self, obs_dim, action_dim, qf_arch):
         super().__init__()
-        self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-
-        def build_q_net():
-            layers = []
-            in_dim = obs_dim + action_dim
-            for h_dim in qf_arch:
-                layers.append(nn.Linear(in_dim, h_dim))
-                layers.append(nn.ReLU())
-                in_dim = h_dim
-            layers.append(nn.Linear(in_dim, 1))
-            return nn.Sequential(*layers)
-
-        self.qf0 = build_q_net()
-        self.qf1 = build_q_net()
+        self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
+        in_dim = obs_dim + action_dim
+        self.qf0 = _build_mlp(in_dim, qf_arch, out_dim=1)
+        self.qf1 = _build_mlp(in_dim, qf_arch, out_dim=1)
 
     def forward(self, obs, action):
-        features = self.features_extractor(obs)
-        q_input = torch.cat([features, action], dim=1)
+        q_input = torch.cat([self.flatten(obs), action], dim=1)
         return self.qf0(q_input), self.qf1(q_input)
 
 
@@ -287,6 +283,94 @@ def evaluate_policy(
     if return_episode_rewards:
         return episode_rewards, episode_lengths
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
+
+
+def maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer):
+    """定期在独立 eval_env 上评估当前策略，记录 evaluations.npz 并在创新高时保存 best_model.pt。"""
+    ep_rewards, ep_lengths = evaluate_policy(
+        policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
+    )
+    eval_mean = float(np.mean(ep_rewards))
+    eval_std = float(np.std(ep_rewards))
+
+    eval_state["timesteps"].append(global_step)
+    eval_state["results"].append(ep_rewards)
+    eval_state["ep_lengths"].append(ep_lengths)
+    np.savez(
+        log_dir / "evaluations.npz",
+        timesteps=np.array(eval_state["timesteps"]),
+        results=np.array(eval_state["results"]),
+        ep_lengths=np.array(eval_state["ep_lengths"]),
+    )
+    writer.add_scalar("eval/mean_reward", eval_mean, global_step)
+    writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
+    print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
+
+    if eval_mean > eval_state["best_mean_reward"]:
+        eval_state["best_mean_reward"] = eval_mean
+        torch.save(policy.state_dict(), eval_state["best_model_path"])
+        print(f"    --> 刷新最高评估记录！已保存最优模型至: {eval_state['best_model_path']}")
+
+
+def update_sac_step(
+    policy,
+    actor_optimizer,
+    critic_optimizer,
+    ent_coef_optimizer,
+    log_ent_coef,
+    target_entropy,
+    replay_buffer,
+    batch_size,
+    gamma,
+    tau,
+):
+    """
+    SAC 单次四阶段梯度更新：
+    (a) 自动调节最大熵温度系数 α (ent_coef)
+    (b) 用 Soft 状态价值 min(Q1', Q2') - α * log π(a'|s') 更新双 Critic 网络
+    (c) 最小化 α * log π(a|s) - min(Q1, Q2) 更新随机策略 Actor
+    (d) Polyak 软更新目标 Critic 网络
+    """
+    batch = replay_buffer.sample(batch_size)
+    sampled_actions, log_prob = policy.actor.get_action_and_log_prob(batch.observations)
+
+    # --- (a) 自动调节最大熵温度系数 α ---
+    ent_coef_loss = -(log_ent_coef * (log_prob + target_entropy).detach()).mean()
+    ent_coef_optimizer.zero_grad()
+    ent_coef_loss.backward()
+    ent_coef_optimizer.step()
+    ent_coef = log_ent_coef.exp().detach()
+
+    # --- (b) 更新截断双 Q 价值网络 (ContinuousCritic) ---
+    with torch.no_grad():
+        next_actions, next_log_prob = policy.actor.get_action_and_log_prob(batch.next_observations)
+        target_q1, target_q2 = policy.critic_target(batch.next_observations, next_actions)
+        min_qf_next_target = torch.min(target_q1, target_q2) - ent_coef * next_log_prob
+        next_q_value = batch.rewards + (1.0 - batch.dones) * gamma * min_qf_next_target
+
+    current_q1, current_q2 = policy.critic(batch.observations, batch.actions)
+    critic_loss = 0.5 * (F.mse_loss(current_q1, next_q_value) + F.mse_loss(current_q2, next_q_value))
+    critic_optimizer.zero_grad()
+    critic_loss.backward()
+    critic_optimizer.step()
+
+    # --- (c) 更新随机策略网络 (Actor) ---
+    q1_pi, q2_pi = policy.critic(batch.observations, sampled_actions)
+    min_qf_pi = torch.min(q1_pi, q2_pi)
+    actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    actor_optimizer.step()
+
+    # --- (d) Polyak 软更新目标 Critic 网络 ---
+    soft_update(policy.critic, policy.critic_target, tau)
+
+    return {
+        "critic_loss": critic_loss.item(),
+        "actor_loss": actor_loss.item(),
+        "ent_coef": ent_coef.item(),
+        "ent_coef_loss": ent_coef_loss.item(),
+    }
 
 
 def main():
@@ -379,16 +463,18 @@ def main():
     # ==========================================================================
     print(f"\n[第 4 步] 开始训练 SAC（总步数 total_timesteps={args.timesteps}）...")
     eval_freq = max(1_000, args.timesteps // 5)
-    best_mean_reward = -float("inf")
-    best_model_path = model_dir / "best_model.pt"
+    eval_state = {
+        "best_mean_reward": -float("inf"),
+        "best_model_path": model_dir / "best_model.pt",
+        "timesteps": [],
+        "results": [],
+        "ep_lengths": [],
+    }
 
     tb_run_dir = log_dir / "SAC_Pendulum"
     tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps = []
-    eval_results = []
-    eval_ep_lengths = []
     recent_ep_rewards = []
     recent_ep_lengths = []
 
@@ -415,84 +501,35 @@ def main():
                 writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
             obs, _ = train_env.reset()
 
-        # 3. 达到预热步数后，每步执行 SAC 的三阶段梯度更新 (温度 α -> Twin Critic -> Actor -> 软更新)
+        # 3. 达到预热步数后，执行 SAC 四阶段梯度更新 (温度 α -> 双 Critic -> Actor -> 软更新)
         if global_step > learning_starts and global_step % train_freq == 0:
+            metrics = None
             for _ in range(gradient_steps):
-                batch = replay_buffer.sample(batch_size)
-
-                # 当前策略对当前状态 s 采样动作并计算 log_prob
-                sampled_actions, log_prob = policy.actor.get_action_and_log_prob(batch.observations)
-
-                # --- (a) 自动调节最大熵温度系数 α (ent_coef) ---
-                # L(α) = E[-log_α * (log π(a|s) + H_target)]
-                ent_coef_loss = -(log_ent_coef * (log_prob + target_entropy).detach()).mean()
-                ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                ent_coef_optimizer.step()
-                ent_coef = log_ent_coef.exp().detach()
-
-                # --- (b) 更新截断双 Q 价值网络 (ContinuousCritic) ---
-                with torch.no_grad():
-                    # 用当前随机策略对下一状态 s' 采样动作 a' 与对数概率 log π(a'|s')
-                    next_actions, next_log_prob = policy.actor.get_action_and_log_prob(batch.next_observations)
-                    target_q1, target_q2 = policy.critic_target(batch.next_observations, next_actions)
-                    # Soft 状态价值：min(Q1', Q2') - α * log π(a'|s')
-                    min_qf_next_target = torch.min(target_q1, target_q2) - ent_coef * next_log_prob
-                    next_q_value = batch.rewards + (1.0 - batch.dones) * gamma * min_qf_next_target
-
-                current_q1, current_q2 = policy.critic(batch.observations, batch.actions)
-                critic_loss = 0.5 * (F.mse_loss(current_q1, next_q_value) + F.mse_loss(current_q2, next_q_value))
-                critic_optimizer.zero_grad()
-                critic_loss.backward()
-                critic_optimizer.step()
-
-                # --- (c) 更新随机策略网络 (Actor) ---
-                # 最小化 E[α * log π(a|s) - min(Q1(s, a), Q2(s, a))]（等价于最大化期望 Q 值 + 策略熵）
-                q1_pi, q2_pi = policy.critic(batch.observations, sampled_actions)
-                min_qf_pi = torch.min(q1_pi, q2_pi)
-                actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-                actor_optimizer.zero_grad()
-                actor_loss.backward()
-                actor_optimizer.step()
-
-                # --- (d) Polyak 软更新目标 Critic 网络 ---
-                for param, target_param in zip(
-                    policy.critic.parameters(), policy.critic_target.parameters()
-                ):
-                    target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-
-            if global_step % 100 == 0:
-                writer.add_scalar("train/critic_loss", critic_loss.item(), global_step)
-                writer.add_scalar("train/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("train/ent_coef", ent_coef.item(), global_step)
-                writer.add_scalar("train/ent_coef_loss", ent_coef_loss.item(), global_step)
+                metrics = update_sac_step(
+                    policy=policy,
+                    actor_optimizer=actor_optimizer,
+                    critic_optimizer=critic_optimizer,
+                    ent_coef_optimizer=ent_coef_optimizer,
+                    log_ent_coef=log_ent_coef,
+                    target_entropy=target_entropy,
+                    replay_buffer=replay_buffer,
+                    batch_size=batch_size,
+                    gamma=gamma,
+                    tau=tau,
+                )
+            if metrics is not None and global_step % 100 == 0:
+                writer.add_scalar("train/critic_loss", metrics["critic_loss"], global_step)
+                writer.add_scalar("train/actor_loss", metrics["actor_loss"], global_step)
+                writer.add_scalar("train/ent_coef", metrics["ent_coef"], global_step)
+                writer.add_scalar("train/ent_coef_loss", metrics["ent_coef_loss"], global_step)
                 writer.add_scalar("time/fps", int(global_step / max(1e-6, time.time() - start_time)), global_step)
 
-        # 4. 定期评估当前策略并保存最优模型（对应 SB3 EvalCallback）
+        # 4. 定期评估当前策略并保存最优模型
         if global_step % eval_freq == 0:
-            ep_rewards, ep_lengths = evaluate_policy(
-                policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
-            )
-            eval_mean = float(np.mean(ep_rewards))
-            eval_std = float(np.std(ep_rewards))
-            eval_timesteps.append(global_step)
-            eval_results.append(ep_rewards)
-            eval_ep_lengths.append(ep_lengths)
-            np.savez(
-                log_dir / "evaluations.npz",
-                timesteps=np.array(eval_timesteps),
-                results=np.array(eval_results),
-                ep_lengths=np.array(eval_ep_lengths),
-            )
-            writer.add_scalar("eval/mean_reward", eval_mean, global_step)
-            writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
-            print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
-            if eval_mean > best_mean_reward:
-                best_mean_reward = eval_mean
-                torch.save(policy.state_dict(), best_model_path)
-                print(f"    --> 刷新最高评估记录！已保存最优模型至: {best_model_path}")
+            maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer)
 
     writer.close()
+    best_model_path = eval_state["best_model_path"]
 
     # ==========================================================================
     # 第 5 步：训练后定量评估

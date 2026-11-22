@@ -153,24 +153,35 @@ class ReplayBuffer:
 # CleanRL 白盒组件 2：TD3 六网络架构 (Actor + ActorTarget + Twin Critic + Twin CriticTarget)
 # 严格对应 SB3 `TD3Policy(net_arch=dict(pi=[256, 256], qf=[256, 256]))`
 # ==============================================================================
+def _build_mlp(in_dim, hidden_dims, out_dim, out_activation=None):
+    """构建带 ReLU 隐藏层的多层感知机（可选输出层激活函数，如 Actor 的 Tanh）。"""
+    layers = []
+    for h_dim in hidden_dims:
+        layers.append(nn.Linear(in_dim, h_dim))
+        layers.append(nn.ReLU())
+        in_dim = h_dim
+    layers.append(nn.Linear(in_dim, out_dim))
+    if out_activation is not None:
+        layers.append(out_activation)
+    return nn.Sequential(*layers)
+
+
+def soft_update(source_net, target_net, tau):
+    """Polyak 目标网络软更新：θ_target ← τ * θ + (1 - τ) * θ_target。"""
+    for param, target_param in zip(source_net.parameters(), target_net.parameters()):
+        target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
+
 class Actor(nn.Module):
     """
     确定性策略网络 μ(s, θ)：
-    最后一层接 Tanh() 将输出压缩至 [-1, 1]，再通过仿射变换还原至物理环境真实量程 [low, high]。
+    (batch, obs_dim) -> [256, 256] (ReLU) -> Tanh 压缩至 [-1, 1] -> 线性映射回真实力矩范围 [low, high]。
     """
 
     def __init__(self, obs_dim, action_dim, pi_arch, action_low, action_high):
         super().__init__()
-        self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-        layers = []
-        in_dim = obs_dim
-        for h_dim in pi_arch:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(nn.ReLU())
-            in_dim = h_dim
-        layers.append(nn.Linear(in_dim, action_dim))
-        layers.append(nn.Tanh())
-        self.mu = nn.Sequential(*layers)
+        self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
+        self.mu = _build_mlp(obs_dim, pi_arch, action_dim, out_activation=nn.Tanh())
 
         self.register_buffer(
             "action_scale",
@@ -182,43 +193,30 @@ class Actor(nn.Module):
         )
 
     def forward(self, obs):
-        features = self.features_extractor(obs)
-        scaled_tanh = self.mu(features)
+        scaled_tanh = self.mu(self.flatten(obs))
         return scaled_tanh * self.action_scale + self.action_bias
 
 
 class ContinuousCritic(nn.Module):
     """
     截断双 Q 价值网络组 (qf0 与 qf1)：
-    输入为状态向量 s 与动作向量 a 的拼接 torch.cat([obs, action], dim=1)，维度为 dim(S) + dim(A)。
+    输入为状态 s 与动作 a 的拼接 torch.cat([obs, action], dim=1)，维度为 obs_dim + action_dim。
     """
 
     def __init__(self, obs_dim, action_dim, qf_arch):
         super().__init__()
-        self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
-
-        def build_q_net():
-            layers = []
-            in_dim = obs_dim + action_dim
-            for h_dim in qf_arch:
-                layers.append(nn.Linear(in_dim, h_dim))
-                layers.append(nn.ReLU())
-                in_dim = h_dim
-            layers.append(nn.Linear(in_dim, 1))
-            return nn.Sequential(*layers)
-
-        self.qf0 = build_q_net()
-        self.qf1 = build_q_net()
+        self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
+        in_dim = obs_dim + action_dim
+        self.qf0 = _build_mlp(in_dim, qf_arch, out_dim=1)
+        self.qf1 = _build_mlp(in_dim, qf_arch, out_dim=1)
 
     def forward(self, obs, action):
-        features = self.features_extractor(obs)
-        q_input = torch.cat([features, action], dim=1)
+        q_input = torch.cat([self.flatten(obs), action], dim=1)
         return self.qf0(q_input), self.qf1(q_input)
 
     def q1_forward(self, obs, action):
         """仅计算第一个 Q 网络 qf0(s, a)，用于计算确定性策略梯度更新 Actor。"""
-        features = self.features_extractor(obs)
-        q_input = torch.cat([features, action], dim=1)
+        q_input = torch.cat([self.flatten(obs), action], dim=1)
         return self.qf0(q_input)
 
 
@@ -277,6 +275,100 @@ def evaluate_policy(
     if return_episode_rewards:
         return episode_rewards, episode_lengths
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
+
+
+def maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer):
+    """定期在独立 eval_env 上评估当前策略，记录 evaluations.npz 并在创新高时保存 best_model.pt。"""
+    ep_rewards, ep_lengths = evaluate_policy(
+        policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
+    )
+    eval_mean = float(np.mean(ep_rewards))
+    eval_std = float(np.std(ep_rewards))
+
+    eval_state["timesteps"].append(global_step)
+    eval_state["results"].append(ep_rewards)
+    eval_state["ep_lengths"].append(ep_lengths)
+    np.savez(
+        log_dir / "evaluations.npz",
+        timesteps=np.array(eval_state["timesteps"]),
+        results=np.array(eval_state["results"]),
+        ep_lengths=np.array(eval_state["ep_lengths"]),
+    )
+    writer.add_scalar("eval/mean_reward", eval_mean, global_step)
+    writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
+    print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
+
+    if eval_mean > eval_state["best_mean_reward"]:
+        eval_state["best_mean_reward"] = eval_mean
+        torch.save(policy.state_dict(), eval_state["best_model_path"])
+        print(f"    --> 刷新最高评估记录！已保存最优模型至: {eval_state['best_model_path']}")
+
+
+def update_td3_episode(
+    policy,
+    actor_optimizer,
+    critic_optimizer,
+    replay_buffer,
+    episode_steps,
+    total_grad_updates,
+    batch_size,
+    gamma,
+    tau,
+    policy_delay,
+    target_policy_noise,
+    target_noise_clip,
+    low_tensor,
+    high_tensor,
+):
+    """
+    TD3 回合末批量梯度更新（本回合走了 episode_steps 步，就执行 episode_steps 次更新）：
+    1. 目标策略平滑 (Target Policy Smoothing)
+    2. 截断双 Q 学习 (Clipped Double Q-Learning) 更新双 Critic
+    3. 延迟策略更新 (Delayed Policy Updates)：每 policy_delay 步更新一次 Actor 并软更新目标网络
+    """
+    actor_losses = []
+    critic_losses = []
+
+    for _ in range(episode_steps):
+        total_grad_updates += 1
+        batch = replay_buffer.sample(batch_size)
+
+        with torch.no_grad():
+            # 【TD3 改进 3：目标策略平滑】给目标动作加截断高斯噪声，平滑 Q 函数在动作维度的局部尖峰
+            clipped_noise = (torch.randn_like(batch.actions) * target_policy_noise).clamp(
+                -target_noise_clip, target_noise_clip
+            )
+            next_actions = (policy.actor_target(batch.next_observations) + clipped_noise).clamp(
+                low_tensor, high_tensor
+            )
+
+            # 【TD3 改进 1：截断双 Q 学习】取两个目标 Critic 预测值的较小者，遏制 Q 值高估
+            target_q1, target_q2 = policy.critic_target(batch.next_observations, next_actions)
+            target_q = torch.min(target_q1, target_q2)
+            td_target = batch.rewards + (1.0 - batch.dones) * gamma * target_q
+
+        # 更新两个主 Critic 网络 (qf0 与 qf1)
+        current_q1, current_q2 = policy.critic(batch.observations, batch.actions)
+        critic_loss = F.mse_loss(current_q1, td_target) + F.mse_loss(current_q2, td_target)
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_optimizer.step()
+        critic_losses.append(critic_loss.item())
+
+        # 【TD3 改进 2：延迟策略更新】每隔 policy_delay=2 步才更新一次 Actor 与 Target 网络
+        if total_grad_updates % policy_delay == 0:
+            actor_loss = -policy.critic.q1_forward(
+                batch.observations, policy.actor(batch.observations)
+            ).mean()
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            actor_optimizer.step()
+            actor_losses.append(actor_loss.item())
+
+            soft_update(policy.critic, policy.critic_target, tau)
+            soft_update(policy.actor, policy.actor_target, tau)
+
+    return total_grad_updates, actor_losses, critic_losses
 
 
 def main():
@@ -373,16 +465,18 @@ def main():
     # ==========================================================================
     print(f"\n[第 4 步] 开始训练 TD3（总步数 total_timesteps={args.timesteps}）...")
     eval_freq = max(1_000, args.timesteps // 5)
-    best_mean_reward = -float("inf")
-    best_model_path = model_dir / "best_model.pt"
+    eval_state = {
+        "best_mean_reward": -float("inf"),
+        "best_model_path": model_dir / "best_model.pt",
+        "timesteps": [],
+        "results": [],
+        "ep_lengths": [],
+    }
 
     tb_run_dir = log_dir / "TD3_Pendulum"
     tb_run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(tb_run_dir))
 
-    eval_timesteps = []
-    eval_results = []
-    eval_ep_lengths = []
     recent_ep_rewards = []
     recent_ep_lengths = []
 
@@ -403,12 +497,12 @@ def main():
             det_action, _ = policy.predict(obs, deterministic=True)
             action = np.clip(det_action + action_noise(), action_low, action_high)
 
-        # 2. 环境交互并存入 ReplayBuffer（注意仅将真正终止 terminated 记为 done）
+        # 2. 环境交互并存入 ReplayBuffer（仅将真正终止 terminated 记为 done）
         next_obs, reward, terminated, truncated, info = train_env.step(action)
         replay_buffer.add(obs, next_obs, action, float(reward), terminated)
         obs = next_obs
 
-        # 3. 当回合结束时（对应 SB3 train_freq=(1, "episode"), gradient_steps=-1）触发批量梯度更新
+        # 3. 回合结束时触发批量梯度更新（对应 SB3 train_freq=(1, "episode"), gradient_steps=-1）
         if terminated or truncated:
             if "episode" in info:
                 recent_ep_rewards.append(float(info["episode"]["r"]))
@@ -417,57 +511,22 @@ def main():
                 writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
 
             if global_step > learning_starts:
-                actor_losses = []
-                critic_losses = []
-                for _ in range(episode_steps):
-                    total_grad_updates += 1
-                    batch = replay_buffer.sample(batch_size)
-
-                    with torch.no_grad():
-                        # 【TD3 改进 3：目标策略平滑 (Target Policy Smoothing)】
-                        # 给目标 Actor 输出的下一动作加上截断高斯噪声，平滑 Q 函数在动作维度的局部尖峰
-                        clipped_noise = (
-                            torch.randn_like(batch.actions) * target_policy_noise
-                        ).clamp(-target_noise_clip, target_noise_clip)
-                        next_actions = (policy.actor_target(batch.next_observations) + clipped_noise).clamp(
-                            low_tensor, high_tensor
-                        )
-
-                        # 【TD3 改进 1：截断双 Q 学习 (Clipped Double Q-Learning)】
-                        # 取两个目标 Critic 网络预测值的较小者，遏制 Q 值高估
-                        target_q1, target_q2 = policy.critic_target(batch.next_observations, next_actions)
-                        target_q = torch.min(target_q1, target_q2)
-                        td_target = batch.rewards + (1.0 - batch.dones) * gamma * target_q
-
-                    # 更新两个主 Critic 网络 (qf0 与 qf1)
-                    current_q1, current_q2 = policy.critic(batch.observations, batch.actions)
-                    critic_loss = F.mse_loss(current_q1, td_target) + F.mse_loss(current_q2, td_target)
-                    critic_optimizer.zero_grad()
-                    critic_loss.backward()
-                    critic_optimizer.step()
-                    critic_losses.append(critic_loss.item())
-
-                    # 【TD3 改进 2：延迟策略更新 (Delayed Policy Updates)】
-                    # 每隔 policy_delay=2 步才更新一次 Actor 与所有 Target 网络
-                    if total_grad_updates % policy_delay == 0:
-                        actor_loss = -policy.critic.q1_forward(
-                            batch.observations, policy.actor(batch.observations)
-                        ).mean()
-                        actor_optimizer.zero_grad()
-                        actor_loss.backward()
-                        actor_optimizer.step()
-                        actor_losses.append(actor_loss.item())
-
-                        # Polyak 软更新目标网络：θ_target ← τ * θ + (1 - τ) * θ_target
-                        for param, target_param in zip(
-                            policy.critic.parameters(), policy.critic_target.parameters()
-                        ):
-                            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-                        for param, target_param in zip(
-                            policy.actor.parameters(), policy.actor_target.parameters()
-                        ):
-                            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-
+                total_grad_updates, actor_losses, critic_losses = update_td3_episode(
+                    policy=policy,
+                    actor_optimizer=actor_optimizer,
+                    critic_optimizer=critic_optimizer,
+                    replay_buffer=replay_buffer,
+                    episode_steps=episode_steps,
+                    total_grad_updates=total_grad_updates,
+                    batch_size=batch_size,
+                    gamma=gamma,
+                    tau=tau,
+                    policy_delay=policy_delay,
+                    target_policy_noise=target_policy_noise,
+                    target_noise_clip=target_noise_clip,
+                    low_tensor=low_tensor,
+                    high_tensor=high_tensor,
+                )
                 if critic_losses:
                     writer.add_scalar("train/critic_loss", float(np.mean(critic_losses)), global_step)
                 if actor_losses:
@@ -477,31 +536,12 @@ def main():
             obs, _ = train_env.reset()
             episode_steps = 0
 
-        # 4. 定期评估当前策略并保存最优模型（对应 SB3 EvalCallback）
+        # 4. 定期评估当前策略并保存最优模型
         if global_step % eval_freq == 0:
-            ep_rewards, ep_lengths = evaluate_policy(
-                policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
-            )
-            eval_mean = float(np.mean(ep_rewards))
-            eval_std = float(np.std(ep_rewards))
-            eval_timesteps.append(global_step)
-            eval_results.append(ep_rewards)
-            eval_ep_lengths.append(ep_lengths)
-            np.savez(
-                log_dir / "evaluations.npz",
-                timesteps=np.array(eval_timesteps),
-                results=np.array(eval_results),
-                ep_lengths=np.array(eval_ep_lengths),
-            )
-            writer.add_scalar("eval/mean_reward", eval_mean, global_step)
-            writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
-            print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
-            if eval_mean > best_mean_reward:
-                best_mean_reward = eval_mean
-                torch.save(policy.state_dict(), best_model_path)
-                print(f"    --> 刷新最高评估记录！已保存最优模型至: {best_model_path}")
+            maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer)
 
     writer.close()
+    best_model_path = eval_state["best_model_path"]
 
     # ==========================================================================
     # 第 5 步：训练后定量评估

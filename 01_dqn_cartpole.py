@@ -147,19 +147,22 @@ class QNetwork(nn.Module):
 
     def __init__(self, obs_dim, n_actions, net_arch):
         super().__init__()
+        # 保留第 0 维（batch 批量维），把第 1 维到最后一维拉成一条一维向量。
         self.features_extractor = nn.Flatten(start_dim=1, end_dim=-1)
         layers = []
-        in_dim = obs_dim
-        for hidden_dim in net_arch:
+        in_dim = obs_dim # 当前层的输入维度4
+        # net_arch：[128, 128]）,这里循环 2 次，hidden_dim 两次都为 128。
+        for hidden_dim in net_arch: 
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, n_actions))
+        layers.append(nn.Linear(in_dim, n_actions)) # n_actions（2）
+        # 使用 *layers把列表里的 5 个对象展开作为独立参数传给 nn.Sequential，串联并赋值给 self.q_net
         self.q_net = nn.Sequential(*layers)
 
     def forward(self, obs):
-        features = self.features_extractor(obs)
-        return self.q_net(features)
+        features = self.features_extractor(obs) # (batch_size, 4) -> (batch_size, 4)
+        return self.q_net(features) # (batch_size, 4) -> (batch_size, 2)
 
 
 class DQNPolicy(nn.Module):
@@ -187,15 +190,18 @@ class DQNPolicy(nn.Module):
         epsilon=0.0,
         action_space=None,
     ):
-        """根据当前观测选择动作：评估时 deterministic=True 贪婪选最大 Q 值；训练时按 ε-greedy 探索。"""
+        '''
+        根据当前观测选择动作：评估时 deterministic=True 贪婪选最大 Q 值；
+        训练时 deterministic=False 按 ε-greedy 探索。
+        '''
         if not deterministic and random.random() < epsilon:
             assert action_space is not None
-            return int(action_space.sample()), None
+            return int(action_space.sample()), None # 等概率随机抽取一个合法动作。
 
         device = next(self.parameters()).device
-        with torch.no_grad():
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            q_values = self.q_net(obs_tensor)
+        with torch.no_grad(): # 临时关闭 PyTorch 的自动求导，只是在做推理选动作。
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0) # 把形状从 (4,) 变成 (1, 4)
+            q_values = self.q_net(obs_tensor) 
             action = int(torch.argmax(q_values, dim=1).item())
         return action, None
 
@@ -298,7 +304,7 @@ def main():
     net_arch = [128, 128]
 
     policy = DQNPolicy(obs_dim=obs_dim, n_actions=n_actions, net_arch=net_arch).to(device)
-    optimizer = optim.Adam(policy.q_net.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(policy.q_net.parameters(), lr=learning_rate) #训练时更新主 Q 网络（policy.q_net）的参数
     replay_buffer = ReplayBuffer(
         buffer_size=buffer_size,
         obs_shape=train_env.observation_space.shape,
@@ -396,10 +402,11 @@ def main():
                 # (c) 计算 Smooth L1 (Huber) 损失并反向传播更新主网络（与 SB3 DQN 完全一致）
                 loss = F.smooth_l1_loss(current_q_values, td_target)
                 optimizer.zero_grad()
-                loss.backward()
+                loss.backward() # 梯度只会传回主网络 policy.q_net
                 nn.utils.clip_grad_norm_(policy.q_net.parameters(), max_grad_norm)
                 optimizer.step()
 
+            # 每隔 100 步向 TensorBoard 记录一次训练状态指标
             if global_step % 100 == 0:
                 sps = int(global_step / max(1e-6, time.time() - start_time))
                 writer.add_scalar("train/loss", loss.item(), global_step)
