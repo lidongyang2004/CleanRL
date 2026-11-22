@@ -29,6 +29,14 @@ TD3 提出了三项极具工程威力的改进（也是名字 Twin Delayed 的�
 因此在训练阶段，必须手动构造一个 ActionNoise 对象（例如 NormalActionNoise 高斯噪声）
 叠加到动作上：a_exec = μ(s) + noise。评估/推理时自动关闭此噪声。
 
+【CleanRL 白盒实现 vs Stable-Baselines3 (SB3) 一一对应关系】
+本脚本的 `main()` 主函数与 `stable-baseline3/03_td3_pendulum.py` **逐行 100% 一致**，
+并在文件上半部分将 SB3 封装的高层类用纯 PyTorch 进行了透明白盒实现：
+- `NormalActionNoise`             <--> 独立同分布高斯动作探索噪声
+- `TD3Policy`                     <--> 显式定义 6 网络架构 (`actor`, `actor_target`, `critic(qf0+qf1)`, `critic_target`)
+- `TD3` (`learn`/`save`/`load`)   <--> 显式展开目标策略平滑、截断双 Q 损失、延迟 Actor 更新与 Polyak 软更新
+- `EvalCallback` & `evaluate_policy` <--> 定期评估并自动保存 `best_model.zip` 与 `evaluations.npz`
+
 【实验环境：Pendulum-v1（倒立摆旋转控制）】
 - 观测空间: Box(3,) —— [cos(θ), sin(θ), 角速度 θ_dot]
 - 动作空间: Box(-2.0, 2.0, (1,), float32) —— 施加在摆杆上的力矩，连续实数 [-2, 2]
@@ -44,7 +52,6 @@ TD3 提出了三项极具工程威力的改进（也是名字 Twin Delayed 的�
 
 import argparse
 import random
-import shutil
 import time
 from pathlib import Path
 from typing import NamedTuple
@@ -58,21 +65,10 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 
-def parse_args():
-    """解析命令行参数（与 SB3 03_td3_pendulum.py 完全一致）。"""
-    parser = argparse.ArgumentParser(description="CleanRL TD3 求解 Pendulum-v1 连续控制示例")
-    parser.add_argument(
-        "--timesteps",
-        type=int,
-        default=20_000,
-        help="总训练步数（Pendulum-v1 在 20000 步左右即可取得优异表现）",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    return parser.parse_args()
-
-
 def set_seed(seed):
     """固定随机种子，保证实验结果可复现。"""
+    if seed is None:
+        return
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -80,11 +76,9 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def reset_dir(dir_path):
-    """清空并重建目录，确保每次运行只保留最新一次记录或模型。"""
-    if dir_path.exists():
-        shutil.rmtree(dir_path)
-    dir_path.mkdir(parents=True, exist_ok=True)
+def Monitor(env):
+    """CleanRL 白盒实现的 Monitor 包装器（对应 SB3 `Monitor`）。"""
+    return gym.wrappers.RecordEpisodeStatistics(env)
 
 
 # ==============================================================================
@@ -95,8 +89,8 @@ class NormalActionNoise:
     """独立同分布的高斯动作噪声（对应 SB3 `NormalActionNoise`）。"""
 
     def __init__(self, mean, sigma):
-        self.mean = mean.astype(np.float32)
-        self.sigma = sigma.astype(np.float32)
+        self.mean = np.asarray(mean, dtype=np.float32)
+        self.sigma = np.asarray(sigma, dtype=np.float32)
 
     def __call__(self):
         return np.random.normal(self.mean, self.sigma).astype(np.float32)
@@ -153,7 +147,12 @@ class ReplayBuffer:
 # CleanRL 白盒组件 2：TD3 六网络架构 (Actor + ActorTarget + Twin Critic + Twin CriticTarget)
 # 严格对应 SB3 `TD3Policy(net_arch=dict(pi=[256, 256], qf=[256, 256]))`
 # ==============================================================================
-def _build_mlp(in_dim, hidden_dims, out_dim, out_activation=None):
+def _build_mlp(
+    in_dim,
+    hidden_dims,
+    out_dim,
+    out_activation = None,
+):
     """构建带 ReLU 隐藏层的多层感知机（可选输出层激活函数，如 Actor 的 Tanh）。"""
     layers = []
     for h_dim in hidden_dims:
@@ -178,7 +177,14 @@ class Actor(nn.Module):
     (batch, obs_dim) -> [256, 256] (ReLU) -> Tanh 压缩至 [-1, 1] -> 线性映射回真实力矩范围 [low, high]。
     """
 
-    def __init__(self, obs_dim, action_dim, pi_arch, action_low, action_high):
+    def __init__(
+        self,
+        obs_dim,
+        action_dim,
+        pi_arch,
+        action_low,
+        action_high,
+    ):
         super().__init__()
         self.flatten = nn.Flatten(start_dim=1, end_dim=-1)
         self.mu = _build_mlp(obs_dim, pi_arch, action_dim, out_activation=nn.Tanh())
@@ -225,10 +231,23 @@ class TD3Policy(nn.Module):
     TD3 完整六网络容器：包含 actor, actor_target, critic (qf0+qf1), critic_target (qf0+qf1)。
     """
 
-    def __init__(self, obs_dim, action_dim, action_low, action_high, net_arch):
+    def __init__(
+        self,
+        obs_dim,
+        action_dim,
+        action_low,
+        action_high,
+        net_arch = None,
+    ):
         super().__init__()
-        pi_arch = net_arch.get("pi", [256, 256])
-        qf_arch = net_arch.get("qf", [256, 256])
+        if isinstance(net_arch, dict):
+            pi_arch = list(net_arch.get("pi", [256, 256]))
+            qf_arch = list(net_arch.get("qf", [256, 256]))
+        elif isinstance(net_arch, list):
+            pi_arch = list(net_arch)
+            qf_arch = list(net_arch)
+        else:
+            pi_arch, qf_arch = [256, 256], [256, 256]
 
         self.actor = Actor(obs_dim, action_dim, pi_arch, action_low, action_high)
         self.actor_target = Actor(obs_dim, action_dim, pi_arch, action_low, action_high)
@@ -238,7 +257,7 @@ class TD3Policy(nn.Module):
         self.critic_target = ContinuousCritic(obs_dim, action_dim, qf_arch)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-    def predict(self, obs, deterministic=True):
+    def predict(self, obs, deterministic = True):
         """推理接口：直接使用 Actor 输出确定性连续动作 μ(s)。"""
         device = next(self.parameters()).device
         with torch.no_grad():
@@ -247,12 +266,15 @@ class TD3Policy(nn.Module):
         return action, None
 
 
+# ==============================================================================
+# CleanRL 白盒组件 3：策略评估 (evaluate_policy) 与评估回调 (EvalCallback)
+# ==============================================================================
 def evaluate_policy(
-    policy,
+    model,
     eval_env,
-    n_eval_episodes=10,
-    deterministic=True,
-    return_episode_rewards=False,
+    n_eval_episodes = 10,
+    deterministic = True,
+    return_episode_rewards = False,
 ):
     """在独立 eval_env 上运行 n_eval_episodes 个完整回合，返回平均奖励与标准差。"""
     episode_rewards = []
@@ -264,7 +286,7 @@ def evaluate_policy(
         ep_reward = 0.0
         ep_len = 0
         while not done:
-            action, _ = policy.predict(obs, deterministic=deterministic)
+            action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, _ = eval_env.step(action)
             ep_reward += float(reward)
             ep_len += 1
@@ -277,119 +299,398 @@ def evaluate_policy(
     return float(np.mean(episode_rewards)), float(np.std(episode_rewards))
 
 
-def maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer):
-    """定期在独立 eval_env 上评估当前策略，记录 evaluations.npz 并在创新高时保存 best_model.pt。"""
-    ep_rewards, ep_lengths = evaluate_policy(
-        policy, eval_env, n_eval_episodes=5, deterministic=True, return_episode_rewards=True
-    )
-    eval_mean = float(np.mean(ep_rewards))
-    eval_std = float(np.std(ep_rewards))
+class EvalCallback:
+    """定期在独立 eval_env 上评估当前策略，记录 evaluations.npz 并在创新高时保存 best_model.zip。"""
 
-    eval_state["timesteps"].append(global_step)
-    eval_state["results"].append(ep_rewards)
-    eval_state["ep_lengths"].append(ep_lengths)
-    np.savez(
-        log_dir / "evaluations.npz",
-        timesteps=np.array(eval_state["timesteps"]),
-        results=np.array(eval_state["results"]),
-        ep_lengths=np.array(eval_state["ep_lengths"]),
-    )
-    writer.add_scalar("eval/mean_reward", eval_mean, global_step)
-    writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), global_step)
-    print(f"  [Eval @ {global_step:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
+    def __init__(
+        self,
+        eval_env,
+        best_model_save_path = None,
+        log_path = None,
+        eval_freq = 10_000,
+        n_eval_episodes = 5,
+        deterministic = True,
+        render = False,
+    ):
+        self.eval_env = eval_env
+        self.best_model_save_path = Path(best_model_save_path) if best_model_save_path else None
+        self.log_path = Path(log_path) if log_path else None
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.deterministic = deterministic
+        self.render = render
 
-    if eval_mean > eval_state["best_mean_reward"]:
-        eval_state["best_mean_reward"] = eval_mean
-        torch.save(policy.state_dict(), eval_state["best_model_path"])
-        print(f"    --> 刷新最高评估记录！已保存最优模型至: {eval_state['best_model_path']}")
+        self.n_calls = 0
+        self.best_mean_reward = -float("inf")
+        self.eval_timesteps = []
+        self.eval_results = []
+        self.eval_ep_lengths = []
 
+    def on_step(self, model, num_timesteps, writer = None):
+        self.n_calls += 1
+        if self.n_calls % self.eval_freq != 0:
+            return
 
-def update_td3_episode(
-    policy,
-    actor_optimizer,
-    critic_optimizer,
-    replay_buffer,
-    episode_steps,
-    total_grad_updates,
-    batch_size,
-    gamma,
-    tau,
-    policy_delay,
-    target_policy_noise,
-    target_noise_clip,
-    low_tensor,
-    high_tensor,
-):
-    """
-    TD3 回合末批量梯度更新（本回合走了 episode_steps 步，就执行 episode_steps 次更新）：
-    1. 目标策略平滑 (Target Policy Smoothing)
-    2. 截断双 Q 学习 (Clipped Double Q-Learning) 更新双 Critic
-    3. 延迟策略更新 (Delayed Policy Updates)：每 policy_delay 步更新一次 Actor 并软更新目标网络
-    """
-    actor_losses = []
-    critic_losses = []
+        ep_rewards, ep_lengths = evaluate_policy(
+            model,
+            self.eval_env,
+            n_eval_episodes=self.n_eval_episodes,
+            deterministic=self.deterministic,
+            return_episode_rewards=True,
+        )
+        eval_mean = float(np.mean(ep_rewards))
+        eval_std = float(np.std(ep_rewards))
 
-    for _ in range(episode_steps):
-        total_grad_updates += 1
-        batch = replay_buffer.sample(batch_size)
+        self.eval_timesteps.append(num_timesteps)
+        self.eval_results.append(ep_rewards)
+        self.eval_ep_lengths.append(ep_lengths)
 
-        with torch.no_grad():
-            # 【TD3 改进 3：目标策略平滑】给目标动作加截断高斯噪声，平滑 Q 函数在动作维度的局部尖峰
-            clipped_noise = (torch.randn_like(batch.actions) * target_policy_noise).clamp(
-                -target_noise_clip, target_noise_clip
-            )
-            next_actions = (policy.actor_target(batch.next_observations) + clipped_noise).clamp(
-                low_tensor, high_tensor
+        if self.log_path is not None:
+            self.log_path.mkdir(parents=True, exist_ok=True)
+            np.savez(
+                self.log_path / "evaluations.npz",
+                timesteps=np.array(self.eval_timesteps),
+                results=np.array(self.eval_results),
+                ep_lengths=np.array(self.eval_ep_lengths),
             )
 
-            # 【TD3 改进 1：截断双 Q 学习】取两个目标 Critic 预测值的较小者，遏制 Q 值高估
-            target_q1, target_q2 = policy.critic_target(batch.next_observations, next_actions)
-            target_q = torch.min(target_q1, target_q2)
-            td_target = batch.rewards + (1.0 - batch.dones) * gamma * target_q
+        if writer is not None:
+            writer.add_scalar("eval/mean_reward", eval_mean, num_timesteps)
+            writer.add_scalar("eval/mean_ep_length", float(np.mean(ep_lengths)), num_timesteps)
 
-        # 更新两个主 Critic 网络 (qf0 与 qf1)
-        current_q1, current_q2 = policy.critic(batch.observations, batch.actions)
-        critic_loss = F.mse_loss(current_q1, td_target) + F.mse_loss(current_q2, td_target)
-        critic_optimizer.zero_grad()
-        critic_loss.backward()
-        critic_optimizer.step()
-        critic_losses.append(critic_loss.item())
+        if getattr(model, "verbose", 1) >= 1:
+            print(f"  [Eval @ {num_timesteps:>6d} steps] episode_reward={eval_mean:.2f} +/- {eval_std:.2f}")
 
-        # 【TD3 改进 2：延迟策略更新】每隔 policy_delay=2 步才更新一次 Actor 与 Target 网络
-        if total_grad_updates % policy_delay == 0:
-            actor_loss = -policy.critic.q1_forward(
-                batch.observations, policy.actor(batch.observations)
-            ).mean()
-            actor_optimizer.zero_grad()
-            actor_loss.backward()
-            actor_optimizer.step()
-            actor_losses.append(actor_loss.item())
+        if eval_mean > self.best_mean_reward:
+            self.best_mean_reward = eval_mean
+            if self.best_model_save_path is not None:
+                self.best_model_save_path.mkdir(parents=True, exist_ok=True)
+                best_path = self.best_model_save_path / "best_model.zip"
+                model.save(best_path)
+                if getattr(model, "verbose", 1) >= 1:
+                    print(f"    --> 刷新最高评估记录！已保存最优模型至: {best_path}")
 
-            soft_update(policy.critic, policy.critic_target, tau)
-            soft_update(policy.actor, policy.actor_target, tau)
 
-    return total_grad_updates, actor_losses, critic_losses
+# ==============================================================================
+# CleanRL 白盒组件 4：TD3 算法主类（与 SB3 `TD3` 接口 1:1 完全对齐）
+# ==============================================================================
+class TD3:
+    """
+    CleanRL 白盒实现的 TD3 算法类（接口与 `stable_baselines3.TD3` 完全一致）：
+    包含目标策略平滑 (Target Policy Smoothing)、截断双 Q 更新 (Clipped Double Q-Learning)
+    与延迟策略软更新 (Delayed Policy Updates)。
+    """
+
+    def __init__(
+        self,
+        policy,
+        env,
+        learning_rate = 1e-3,
+        gamma = 0.99,
+        buffer_size = 100_000,
+        learning_starts = 1_000,
+        batch_size = 100,
+        train_freq = (1, "episode"),
+        gradient_steps = -1,
+        tau = 0.005,
+        action_noise = None,
+        policy_delay = 2,
+        target_policy_noise = 0.2,
+        target_noise_clip = 0.5,
+        policy_kwargs = None,
+        tensorboard_log = None,
+        seed = None,
+        verbose = 1,
+        _obs_shape = None,
+        _action_dim = None,
+        _action_low = None,
+        _action_high = None,
+    ):
+        set_seed(seed)
+        self.policy_name = policy
+        self.env = env
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.buffer_size = buffer_size
+        self.learning_starts = learning_starts
+        self.batch_size = batch_size
+        self.train_freq = train_freq
+        self.gradient_steps = gradient_steps
+        self.tau = tau
+        self.action_noise = action_noise
+        self.policy_delay = policy_delay
+        self.target_policy_noise = target_policy_noise
+        self.target_noise_clip = target_noise_clip
+        self.policy_kwargs = policy_kwargs or {}
+        self.tensorboard_log = tensorboard_log
+        self.seed = seed
+        self.verbose = verbose
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if env is not None:
+            self.obs_shape = tuple(env.observation_space.shape)
+            self.action_dim = int(env.action_space.shape[-1])
+            self.action_low = np.array(env.action_space.low, dtype=np.float32)
+            self.action_high = np.array(env.action_space.high, dtype=np.float32)
+        else:
+            assert _obs_shape is not None and _action_dim is not None
+            assert _action_low is not None and _action_high is not None
+            self.obs_shape = tuple(_obs_shape)
+            self.action_dim = int(_action_dim)
+            self.action_low = np.array(_action_low, dtype=np.float32)
+            self.action_high = np.array(_action_high, dtype=np.float32)
+
+        self.obs_dim = int(np.prod(self.obs_shape))
+        self.net_arch = self.policy_kwargs.get("net_arch", dict(pi=[256, 256], qf=[256, 256]))
+
+        self.policy = TD3Policy(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            action_low=self.action_low,
+            action_high=self.action_high,
+            net_arch=self.net_arch,
+        ).to(self.device)
+        self.actor_optimizer = optim.Adam(self.policy.actor.parameters(), lr=self.learning_rate)
+        self.critic_optimizer = optim.Adam(self.policy.critic.parameters(), lr=self.learning_rate)
+        self.replay_buffer = ReplayBuffer(
+            buffer_size=self.buffer_size,
+            obs_shape=self.obs_shape,
+            action_dim=self.action_dim,
+            device=self.device,
+        )
+
+    def predict(self, obs, deterministic = True):
+        return self.policy.predict(obs, deterministic=deterministic)
+
+    def _update_td3(
+        self,
+        num_grad_steps,
+        total_grad_updates,
+        low_tensor,
+        high_tensor,
+    ):
+        """
+        TD3 批量梯度更新：
+        1. 目标策略平滑 (Target Policy Smoothing)
+        2. 截断双 Q 学习 (Clipped Double Q-Learning) 更新双 Critic
+        3. 延迟策略更新 (Delayed Policy Updates)：每 policy_delay 步更新一次 Actor 并软更新目标网络
+        """
+        actor_losses = []
+        critic_losses = []
+
+        for _ in range(num_grad_steps):
+            total_grad_updates += 1
+            batch = self.replay_buffer.sample(self.batch_size)
+
+            with torch.no_grad():
+                # 【TD3 改进 3：目标策略平滑】给目标动作加截断高斯噪声，平滑 Q 函数在动作维度的局部尖峰
+                clipped_noise = (torch.randn_like(batch.actions) * self.target_policy_noise).clamp(
+                    -self.target_noise_clip, self.target_noise_clip
+                )
+                next_actions = (self.policy.actor_target(batch.next_observations) + clipped_noise).clamp(
+                    low_tensor, high_tensor
+                )
+
+                # 【TD3 改进 1：截断双 Q 学习】取两个目标 Critic 预测值的较小者，遏制 Q 值高估
+                target_q1, target_q2 = self.policy.critic_target(batch.next_observations, next_actions)
+                target_q = torch.min(target_q1, target_q2)
+                td_target = batch.rewards + (1.0 - batch.dones) * self.gamma * target_q
+
+            # 更新两个主 Critic 网络 (qf0 与 qf1)
+            current_q1, current_q2 = self.policy.critic(batch.observations, batch.actions)
+            critic_loss = F.mse_loss(current_q1, td_target) + F.mse_loss(current_q2, td_target)
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic_optimizer.step()
+            critic_losses.append(critic_loss.item())
+
+            # 【TD3 改进 2：延迟策略更新】每隔 policy_delay=2 步才更新一次 Actor 与 Target 网络
+            if total_grad_updates % self.policy_delay == 0:
+                actor_loss = -self.policy.critic.q1_forward(
+                    batch.observations, self.policy.actor(batch.observations)
+                ).mean()
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+                actor_losses.append(actor_loss.item())
+
+                soft_update(self.policy.critic, self.policy.critic_target, self.tau)
+                soft_update(self.policy.actor, self.policy.actor_target, self.tau)
+
+        return total_grad_updates, actor_losses, critic_losses
+
+    def learn(
+        self,
+        total_timesteps,
+        callback = None,
+        tb_log_name = "TD3",
+        progress_bar = False,
+    ):
+        assert self.env is not None, "训练前必须绑定环境 env"
+        writer = None
+        if self.tensorboard_log is not None:
+            tb_run_dir = Path(self.tensorboard_log) / tb_log_name
+            tb_run_dir.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(log_dir=str(tb_run_dir))
+
+        recent_ep_rewards = []
+        recent_ep_lengths = []
+
+        obs, _ = self.env.reset(seed=self.seed)
+        episode_steps = 0
+        total_grad_updates = 0
+        start_time = time.time()
+        low_tensor = torch.as_tensor(self.action_low, dtype=torch.float32, device=self.device)
+        high_tensor = torch.as_tensor(self.action_high, dtype=torch.float32, device=self.device)
+
+        is_episode_freq = isinstance(self.train_freq, tuple) and self.train_freq[1] == "episode"
+        step_freq = self.train_freq[0] if isinstance(self.train_freq, tuple) else int(self.train_freq)
+
+        for global_step in range(1, total_timesteps + 1):
+            episode_steps += 1
+
+            # 1. 选择连续动作：预热期纯随机采样；正式期使用 Actor 输出并叠加高斯探索噪声
+            if global_step <= self.learning_starts:
+                action = self.env.action_space.sample()
+            else:
+                det_action, _ = self.policy.predict(obs, deterministic=True)
+                noise = self.action_noise() if self.action_noise is not None else 0.0
+                action = np.clip(det_action + noise, self.action_low, self.action_high)
+
+            # 2. 环境交互并存入 ReplayBuffer（仅将真正终止 terminated 记为 done）
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
+            self.replay_buffer.add(obs, next_obs, action, float(reward), terminated)
+            obs = next_obs
+
+            # 按步更新模式（若 train_freq 为整数步数）
+            if not is_episode_freq and global_step > self.learning_starts and global_step % step_freq == 0:
+                n_grads = step_freq if self.gradient_steps == -1 else self.gradient_steps
+                total_grad_updates, actor_losses, critic_losses = self._update_td3(
+                    num_grad_steps=n_grads,
+                    total_grad_updates=total_grad_updates,
+                    low_tensor=low_tensor,
+                    high_tensor=high_tensor,
+                )
+
+            # 3. 回合结束时记录日志，并在 train_freq=(1, "episode") 模式下触发批量梯度更新
+            if terminated or truncated:
+                if "episode" in info:
+                    recent_ep_rewards.append(float(info["episode"]["r"]))
+                    recent_ep_lengths.append(int(info["episode"]["l"]))
+                    if writer is not None:
+                        writer.add_scalar("rollout/ep_rew_mean", float(np.mean(recent_ep_rewards[-100:])), global_step)
+                        writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
+
+                if is_episode_freq and global_step > self.learning_starts:
+                    n_grads = episode_steps if self.gradient_steps == -1 else self.gradient_steps
+                    total_grad_updates, actor_losses, critic_losses = self._update_td3(
+                        num_grad_steps=n_grads,
+                        total_grad_updates=total_grad_updates,
+                        low_tensor=low_tensor,
+                        high_tensor=high_tensor,
+                    )
+                    if writer is not None:
+                        if critic_losses:
+                            writer.add_scalar("train/critic_loss", float(np.mean(critic_losses)), global_step)
+                        if actor_losses:
+                            writer.add_scalar("train/actor_loss", float(np.mean(actor_losses)), global_step)
+                        writer.add_scalar("time/fps", int(global_step / max(1e-6, time.time() - start_time)), global_step)
+
+                obs, _ = self.env.reset()
+                episode_steps = 0
+
+            # 4. 定期评估当前策略并保存最优模型
+            if callback is not None:
+                callback.on_step(self, global_step, writer=writer)
+
+        if writer is not None:
+            writer.close()
+        return self
+
+    def save(self, path):
+        checkpoint = {
+            "policy_name": self.policy_name,
+            "obs_shape": self.obs_shape,
+            "action_dim": self.action_dim,
+            "action_low": self.action_low,
+            "action_high": self.action_high,
+            "learning_rate": self.learning_rate,
+            "gamma": self.gamma,
+            "buffer_size": self.buffer_size,
+            "learning_starts": self.learning_starts,
+            "batch_size": self.batch_size,
+            "train_freq": self.train_freq,
+            "gradient_steps": self.gradient_steps,
+            "tau": self.tau,
+            "policy_delay": self.policy_delay,
+            "target_policy_noise": self.target_policy_noise,
+            "target_noise_clip": self.target_noise_clip,
+            "policy_kwargs": self.policy_kwargs,
+            "state_dict": self.policy.state_dict(),
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load(cls, path, env = None):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        model = cls(
+            policy=checkpoint.get("policy_name", "MlpPolicy"),
+            env=env,
+            learning_rate=checkpoint.get("learning_rate", 1e-3),
+            gamma=checkpoint.get("gamma", 0.99),
+            buffer_size=checkpoint.get("buffer_size", 100_000),
+            learning_starts=checkpoint.get("learning_starts", 1_000),
+            batch_size=checkpoint.get("batch_size", 100),
+            train_freq=checkpoint.get("train_freq", (1, "episode")),
+            gradient_steps=checkpoint.get("gradient_steps", -1),
+            tau=checkpoint.get("tau", 0.005),
+            policy_delay=checkpoint.get("policy_delay", 2),
+            target_policy_noise=checkpoint.get("target_policy_noise", 0.2),
+            target_noise_clip=checkpoint.get("target_noise_clip", 0.5),
+            policy_kwargs=checkpoint.get("policy_kwargs", dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))),
+            verbose=0,
+            _obs_shape=checkpoint.get("obs_shape"),
+            _action_dim=checkpoint.get("action_dim"),
+            _action_low=checkpoint.get("action_low"),
+            _action_high=checkpoint.get("action_high"),
+        )
+        model.policy.load_state_dict(checkpoint["state_dict"])
+        model.policy.eval()
+        return model
+
+
+def parse_args():
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="SB3 TD3 求解 Pendulum-v1 连续控制示例")
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=20_000,
+        help="总训练步数（Pendulum-v1 在 20000 步左右即可取得优异表现）",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
     env_id = "Pendulum-v1"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     base_dir = Path(__file__).resolve().parent
     model_dir = base_dir / "models" / "td3_pendulum"
     log_dir = base_dir / "logs" / "td3_pendulum"
-    reset_dir(model_dir)
-    reset_dir(log_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # ==========================================================================
     # 第 1 步：环境初始化与连续动作空间剖析
     # ==========================================================================
     print("=" * 70)
     print(f"[第 1 步] 创建 Gymnasium 连续控制环境: {env_id}")
-    train_env = gym.wrappers.RecordEpisodeStatistics(gym.make(env_id))
-    eval_env = gym.wrappers.RecordEpisodeStatistics(gym.make(env_id))
+    train_env = Monitor(gym.make(env_id))
+    eval_env = Monitor(gym.make(env_id))
 
     print(f"  观测空间 (Observation Space): {train_env.observation_space}")
     print(f"  动作空间 (Action Space):      {train_env.action_space}")
@@ -398,57 +699,51 @@ def main():
     print(f"  动作上界 (High):              {train_env.action_space.high}")
 
     # ==========================================================================
-    # 第 2 步：配置探索噪声、网络结构与 TD3 模型（CleanRL 白盒实例化）
+    # 第 2 步：配置探索噪声、网络结构与 TD3 模型
     # ==========================================================================
     print("\n[第 2 步] 配置动作探索噪声与 TD3 核心超参数...")
 
-    obs_dim = int(np.prod(train_env.observation_space.shape))
-    n_actions = int(train_env.action_space.shape[-1])
-    action_low = train_env.action_space.low
-    action_high = train_env.action_space.high
-    action_scale = float((action_high[0] - action_low[0]) / 2.0)
-
-    # 构造独立同分布的高斯动作噪声：均值为 0，标准差为 0.1 * action_scale（对应 SB3 NormalActionNoise）
+    # 获取连续动作的维度（Pendulum-v1 为 1 维）
+    n_actions = train_env.action_space.shape[-1]
+    # 构造独立同分布的高斯动作噪声：均值为 0，标准差为 0.1（相对于动作范围 [-2, 2] 来说探索幅度适中）
+    # SB3 在 model.learn() 期间会自动把该噪声加到 Actor 输出的动作上（并裁剪到合法动作范围）
     action_noise = NormalActionNoise(
         mean=np.zeros(n_actions),
-        sigma=0.1 * action_scale * np.ones(n_actions),
+        sigma=0.1 * np.ones(n_actions),
     )
 
     # 对 Off-Policy Actor-Critic 算法（TD3 / SAC），net_arch 字典中：
     # - pi 代表 Actor（策略网络）的隐藏层结构
     # - qf 代表 Critic（Q 价值网络）的隐藏层结构（注意不是 vf，因为 TD3 学的是 Q(s,a)）
-    net_arch = dict(pi=[256, 256], qf=[256, 256])
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256], qf=[256, 256]))
 
-    # --- 学习率、折扣与经验回放池（与 SB3 03_td3_pendulum.py 严格 1:1 对齐）---
-    learning_rate = 1e-3          # 学习率（Pendulum 常用 1e-3，复杂 MuJoCo 环境常用 3e-4）
-    gamma = 0.99                  # 折扣因子 γ
-    buffer_size = 100_000         # 经验回放池大小
-    learning_starts = 1_000       # 预热步数：前 1000 步纯粹随机采样填充经验池，之后开始梯度更新
-    batch_size = 100              # 每次更新采样的批大小（TD3 论文默认 100 或 256）
+    model = TD3(
+        policy="MlpPolicy",
+        env=train_env,
 
-    # --- 训练频率与软更新 ---
-    # 对应 SB3 train_freq=(1, "episode"), gradient_steps=-1：每结束 1 个回合，收集了多少步就做多少次梯度更新
-    tau = 0.005                   # 目标网络软更新系数（Polyak Averaging）：θ_target = τ*θ + (1-τ)*θ_target
+        # --- 学习率、折扣与经验回放池 ---
+        learning_rate=1e-3,          # 学习率（Pendulum 常用 1e-3，复杂 MuJoCo 环境常用 3e-4）
+        gamma=0.99,                  # 折扣因子 γ
+        buffer_size=100_000,         # 经验回放池大小
+        learning_starts=1_000,       # 预热步数：前 1000 步纯粹随机采样填充经验池，之后开始梯度更新
+        batch_size=100,              # 每次更新采样的批大小（TD3 论文默认 100 或 256）
 
-    # --- TD3 专属核心超参数 ---
-    policy_delay = 2              # 延迟策略更新：Critic 更新 2 次，Actor 与目标网络才更新 1 次
-    target_policy_noise = 0.2 * action_scale   # 目标策略平滑噪声标准差
-    target_noise_clip = 0.5 * action_scale     # 目标策略平滑噪声裁剪边界
+        # --- 训练频率与软更新 ---
+        train_freq=(1, "episode"),   # 每结束 1 个完整回合（或设为 1 表示每 1 步）执行一次更新
+        gradient_steps=-1,           # -1 表示本次收集了多少步环境数据，就做多少次梯度更新（与 train_freq=(1,"episode") 配合极佳）
+        tau=0.005,                   # 目标网络软更新系数（Polyak Averaging）：θ_target = τ*θ + (1-τ)*θ_target
 
-    policy = TD3Policy(
-        obs_dim=obs_dim,
-        action_dim=n_actions,
-        action_low=action_low,
-        action_high=action_high,
-        net_arch=net_arch,
-    ).to(device)
-    actor_optimizer = optim.Adam(policy.actor.parameters(), lr=learning_rate)
-    critic_optimizer = optim.Adam(policy.critic.parameters(), lr=learning_rate)
-    replay_buffer = ReplayBuffer(
-        buffer_size=buffer_size,
-        obs_shape=train_env.observation_space.shape,
-        action_dim=n_actions,
-        device=device,
+        # --- TD3 专属核心超参数 ---
+        action_noise=action_noise,   # 探索噪声对象（极其重要！不传则确定性策略几乎不探索）
+        policy_delay=2,              # 延迟策略更新：Critic 更新 2 次，Actor 与目标网络才更新 1 次
+        target_policy_noise=0.2,     # 目标策略平滑噪声标准差：计算目标 Q 值时给目标动作加的高斯噪声
+        target_noise_clip=0.5,       # 目标策略平滑噪声裁剪边界 [-0.5, 0.5]
+
+        # --- 网络结构与日志 ---
+        policy_kwargs=policy_kwargs,
+        tensorboard_log=str(log_dir),
+        seed=args.seed,
+        verbose=1,
     )
 
     # ==========================================================================
@@ -456,99 +751,38 @@ def main():
     # ==========================================================================
     print("\n[第 3 步] 训练前基线评估...")
     mean_reward_before, std_reward_before = evaluate_policy(
-        policy, eval_env, n_eval_episodes=10, deterministic=True
+        model, eval_env, n_eval_episodes=10, deterministic=True
     )
     print(f"  训练前平均奖励: {mean_reward_before:.2f} +/- {std_reward_before:.2f}")
 
     # ==========================================================================
-    # 第 4 步：启动 CleanRL TD3 白盒训练主循环与定期评估
+    # 第 4 步：配置 EvalCallback 并启动训练
     # ==========================================================================
     print(f"\n[第 4 步] 开始训练 TD3（总步数 total_timesteps={args.timesteps}）...")
     eval_freq = max(1_000, args.timesteps // 5)
-    eval_state = {
-        "best_mean_reward": -float("inf"),
-        "best_model_path": model_dir / "best_model.pt",
-        "timesteps": [],
-        "results": [],
-        "ep_lengths": [],
-    }
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(model_dir),
+        log_path=str(log_dir),
+        eval_freq=eval_freq,
+        n_eval_episodes=5,
+        deterministic=True,
+        render=False,
+    )
 
-    tb_run_dir = log_dir / "TD3_Pendulum"
-    tb_run_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(tb_run_dir))
-
-    recent_ep_rewards = []
-    recent_ep_lengths = []
-
-    obs, _ = train_env.reset(seed=args.seed)
-    episode_steps = 0
-    total_grad_updates = 0
-    start_time = time.time()
-    low_tensor = torch.as_tensor(action_low, dtype=torch.float32, device=device)
-    high_tensor = torch.as_tensor(action_high, dtype=torch.float32, device=device)
-
-    for global_step in range(1, args.timesteps + 1):
-        episode_steps += 1
-
-        # 1. 选择连续动作：预热期纯随机采样；正式期使用 Actor 输出并叠加高斯探索噪声
-        if global_step <= learning_starts:
-            action = train_env.action_space.sample()
-        else:
-            det_action, _ = policy.predict(obs, deterministic=True)
-            action = np.clip(det_action + action_noise(), action_low, action_high)
-
-        # 2. 环境交互并存入 ReplayBuffer（仅将真正终止 terminated 记为 done）
-        next_obs, reward, terminated, truncated, info = train_env.step(action)
-        replay_buffer.add(obs, next_obs, action, float(reward), terminated)
-        obs = next_obs
-
-        # 3. 回合结束时触发批量梯度更新（对应 SB3 train_freq=(1, "episode"), gradient_steps=-1）
-        if terminated or truncated:
-            if "episode" in info:
-                recent_ep_rewards.append(float(info["episode"]["r"]))
-                recent_ep_lengths.append(int(info["episode"]["l"]))
-                writer.add_scalar("rollout/ep_rew_mean", float(np.mean(recent_ep_rewards[-100:])), global_step)
-                writer.add_scalar("rollout/ep_len_mean", float(np.mean(recent_ep_lengths[-100:])), global_step)
-
-            if global_step > learning_starts:
-                total_grad_updates, actor_losses, critic_losses = update_td3_episode(
-                    policy=policy,
-                    actor_optimizer=actor_optimizer,
-                    critic_optimizer=critic_optimizer,
-                    replay_buffer=replay_buffer,
-                    episode_steps=episode_steps,
-                    total_grad_updates=total_grad_updates,
-                    batch_size=batch_size,
-                    gamma=gamma,
-                    tau=tau,
-                    policy_delay=policy_delay,
-                    target_policy_noise=target_policy_noise,
-                    target_noise_clip=target_noise_clip,
-                    low_tensor=low_tensor,
-                    high_tensor=high_tensor,
-                )
-                if critic_losses:
-                    writer.add_scalar("train/critic_loss", float(np.mean(critic_losses)), global_step)
-                if actor_losses:
-                    writer.add_scalar("train/actor_loss", float(np.mean(actor_losses)), global_step)
-                writer.add_scalar("time/fps", int(global_step / max(1e-6, time.time() - start_time)), global_step)
-
-            obs, _ = train_env.reset()
-            episode_steps = 0
-
-        # 4. 定期评估当前策略并保存最优模型
-        if global_step % eval_freq == 0:
-            maybe_evaluate_and_save(policy, eval_env, global_step, eval_state, log_dir, writer)
-
-    writer.close()
-    best_model_path = eval_state["best_model_path"]
+    model.learn(
+        total_timesteps=args.timesteps,
+        callback=eval_callback,
+        tb_log_name="TD3_Pendulum",
+        progress_bar=False,
+    )
 
     # ==========================================================================
     # 第 5 步：训练后定量评估
     # ==========================================================================
     print("\n[第 5 步] 训练完成！正在评估最终模型表现...")
     mean_reward_after, std_reward_after = evaluate_policy(
-        policy, eval_env, n_eval_episodes=10, deterministic=True
+        model, eval_env, n_eval_episodes=10, deterministic=True
     )
     print(f"  训练前平均奖励: {mean_reward_before:.2f} +/- {std_reward_before:.2f}")
     print(f"  训练后平均奖励: {mean_reward_after:.2f} +/- {std_reward_after:.2f}")
@@ -556,22 +790,15 @@ def main():
     # ==========================================================================
     # 第 6 步：模型保存与重新加载
     # ==========================================================================
-    final_model_path = model_dir / "td3_pendulum_final.pt"
+    final_model_path = model_dir / "td3_pendulum_final.zip"
     print(f"\n[第 6 步] 保存最终模型到: {final_model_path}")
-    torch.save(policy.state_dict(), final_model_path)
+    model.save(final_model_path)
 
-    del policy
+    del model
+    best_model_path = model_dir / "best_model.zip"
     load_path = best_model_path if best_model_path.exists() else final_model_path
     print(f"  从磁盘重新加载模型: {load_path}")
-    loaded_model = TD3Policy(
-        obs_dim=obs_dim,
-        action_dim=n_actions,
-        action_low=action_low,
-        action_high=action_high,
-        net_arch=net_arch,
-    ).to(device)
-    loaded_model.load_state_dict(torch.load(load_path, map_location=device, weights_only=True))
-    loaded_model.eval()
+    loaded_model = TD3.load(load_path, env=eval_env)
 
     # ==========================================================================
     # 第 7 步：Gymnasium 标准五元组推理闭环演示

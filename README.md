@@ -1,6 +1,6 @@
 # CleanRL (PyTorch + Gymnasium) 从 0 实战教程
 
-本项目包含一套完整的 **CleanRL（单文件 PyTorch 白盒实现）+ Gymnasium** 实战教程代码，与同级目录下的 [stable-baseline3](../stable-baseline3) 项目**严格一一对应**，涵盖强化学习四大主流核心算法（**DQN、PPO、TD3、SAC**）在离散与连续动作空间下的完整中文注释可运行脚本。
+本项目包含一套完整的 **CleanRL（单文件 PyTorch 白盒实现）+ Gymnasium** 实战教程代码，与同级目录下的 [stable-baseline3](../stable-baseline3) 项目**严格一一对应**（所有脚本的 `main()` 主函数与 `stable-baseline3` 对应脚本 **100% 逐行一致**，并在每个单文件上半部分用纯 PyTorch 白盒实现了 `DQN` / `PPO` / `TD3` / `SAC`、`Monitor`、`make_vec_env`、`EvalCallback` 与 `evaluate_policy`），涵盖强化学习四大主流核心算法（**DQN、PPO、TD3、SAC**）在离散与连续动作空间下的完整中文注释可运行脚本。
 
 ## 目录结构
 
